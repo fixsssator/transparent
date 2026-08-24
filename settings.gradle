@@ -1,0 +1,18 @@
+pluginManagement {
+    repositories {
+        google()
+        mavenCentral()
+        gradlePluginPortal()
+    }
+}
+dependencyResolutionManagement {
+    repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+    repositories {
+        google()
+        mavenCentral()
+        // Репозиторий с Xposed API (rovo89), нужен для compileOnly-зависимости ниже
+        maven { url 'https://api.xposed.info/' }
+    }
+}
+rootProject.name = "TransparentTelegram"
+include ':app'
