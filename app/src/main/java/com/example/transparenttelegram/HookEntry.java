@@ -48,7 +48,7 @@ public class HookEntry implements IXposedHookLoadPackage {
             "com.radolyn.ayugram",           // AyuGram — проверено по манифесту
             "tw.nekomimi.nekogram",          // Nekogram — проверено (F-Droid/GitLab RFP)
             "nekox.messenger",               // NekoX — проверено (F-Droid)
-            "com.radolyn.ayugram.web",       // AyuGram Web/альтернативная сборка (если есть)
+            "com.radolyn.ayugram.web"        // AyuGram Web/альтернативная сборка (если есть)
 
             // Ниже — форки, для которых applicationId не проверял лично.
             // Раскомментируйте и протестируйте перед использованием:
