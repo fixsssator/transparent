@@ -5,11 +5,23 @@
 `org.telegram.ui.LaunchActivity.onCreate()`, без патчинга ресурсов
 конкретного APK.
 
-Технически: `Window.addFlags(FLAG_SHOW_WALLPAPER)` +
-`setBackgroundDrawable(new ColorDrawable(0x80000000))` — это ровно тот
-же эффект, что в оригинальной сборке был получен правкой
-`android:windowShowWallpaper` / `android:windowBackground` в
-res/values/styles.xml (стили Theme.TMessages / .Dark / .Start).
+Технически: главный фикс — `Window.setFormat(PixelFormat.TRANSLUCENT)`.
+Одного `Window.addFlags(FLAG_SHOW_WALLPAPER)` + `setBackgroundDrawable(...)`
+недостаточно: без явного переключения формата окна в TRANSLUCENT окно
+остаётся непрозрачным на уровне композитинга, и обои системы физически
+не могут просвечивать — именно это было упущено в первой версии модуля,
+из-за чего эффект не проявлялся на AyuGram.
+
+Почему не через `XC_InitPackageResources`/`XResources`: этот механизм
+перехватывает `Resources.getColor()/getDrawable()` для именованных
+ресурсов, а `android:windowShowWallpaper`/`colorBackground` — это
+атрибуты внутри `<style>`, которые Android резолвит через
+`obtainStyledAttributes()` в нативном коде при создании `PhoneWindow`,
+до вызова любых Java-методов `Resources`, доступных для перехвата этим
+способом. Технически можно долбить `TypedArray.mData` через рефлексию,
+но раскладка этого массива зависит от версии Android/прошивки —
+слишком хрупко. `Window#setFormat()` — публичный официальный API,
+дающий тот же результат надёжнее.
 
 Список целевых пакетов и настройка альфы — в
 `app/src/main/java/com/example/transparenttelegram/HookEntry.java`,
