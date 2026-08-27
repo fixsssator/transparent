@@ -23,1229 +23,307 @@ import de.robv.android.xposed.XposedBridge;
 import de.robv.android.xposed.XposedHelpers;
 import de.robv.android.xposed.callbacks.XC_LoadPackage;
 
+/**
+ * ДИАГНОСТИЧЕСКАЯ версия. Прежние 2 попытки (флаги/фон окна, затем
+ * + setFormat(TRANSLUCENT)) выполнялись без единого исключения
+ * (подтверждено логами LSPosed на реальном устройстве: "Hooks installed",
+ * "Window prepared", множество "Transparency applied" без единого
+ * "failed"), но визуально ничего не менялось. Значит наш код в принципе
+ * доходит до нужных точек, но либо:
+ *   а) что-то перерисовывает поверх ПОСЛЕ нас (асинхронно, после
+ *      onResume -- например отложенная загрузка темы/обоев Telegram),
+ *   б) реальный "непрозрачный слой" рисуется не в Window/DecorView и не
+ *      в первых 1-2 уровнях View, а глубже в иерархии, куда предыдущая
+ *      версия не доставала.
+ *
+ * Вместо того чтобы гадать дальше вслепую, эта версия ОДИН РАЗ (через
+ * 1.5 сек после onResume, чтобы дать Telegram время на асинхронную
+ * инициализацию темы) дампит в лог LSPosed реальное состояние: флаги
+ * окна, фон/альфу DecorView и всех его потомков на нескольких уровнях
+ * вглубь. По этому логу будет видно ТОЧНО, какой View рисует
+ * непрозрачный слой -- дальше патчим прицельно именно его, а не всё
+ * подряд.
+ *
+ * Как читать лог: LSPosed Manager -> Logs, искать "[TransparentTelegram]
+ * [DIAG]". Нужен весь блок целиком (может быть длинным).
+ */
 public class HookEntry implements IXposedHookLoadPackage {
 
-    /*
-     * ============================================================
-     * TARGET PACKAGES
-     * ============================================================
-     */
+    private static final Set<String> TARGET_PACKAGES = new HashSet<>(Arrays.asList(
+            "org.telegram.messenger",
+            "org.telegram.messenger.beta",
+            "org.telegram.messenger.web",
+            "com.radolyn.ayugram",
+            "com.radolyn.ayugram.web",
+            "tw.nekomimi.nekogram",
+            "nekox.messenger"
+    ));
 
-    private static final Set<String> TARGET_PACKAGES =
-            new HashSet<>(Arrays.asList(
-                    "org.telegram.messenger",
-                    "org.telegram.messenger.beta",
-                    "org.telegram.messenger.web",
+    private static final String LAUNCH_ACTIVITY_CLASS = "org.telegram.ui.LaunchActivity";
 
-                    "com.radolyn.ayugram",
-                    "com.radolyn.ayugram.web",
+    private static final int ALPHA = 0x80;
+    private static final int WINDOW_BACKGROUND_COLOR = Color.argb(ALPHA, 0, 0, 0);
+    private static final int MAX_DEPTH = 8;      // насколько глубоко логируем дерево View
+    private static final int MAX_CHILDREN = 6;   // максимум детей на уровень (чтобы не залить лог)
 
-                    "tw.nekomimi.nekogram",
-                    "nekox.messenger"
-            ));
-
-    private static final String LAUNCH_ACTIVITY_CLASS =
-            "org.telegram.ui.LaunchActivity";
-
-    /*
-     * ============================================================
-     * HANDLER
-     * ============================================================
-     */
-
-    private static final Handler MAIN_HANDLER =
-            new Handler(Looper.getMainLooper());
-
-    /*
-     * ============================================================
-     * DIAGNOSTICS
-     * ============================================================
-     */
-
-    private static final int MAX_DEPTH = 40;
-    private static final int MAX_CHILDREN = 8;
-
+    // чтобы не дампить дерево при каждом onResume -- достаточно 1 раза за процесс
     private static volatile boolean diagnosticsDumped = false;
 
-    /*
-     * ============================================================
-     * LOAD PACKAGE
-     * ============================================================
-     */
-
     @Override
-    public void handleLoadPackage(
-            XC_LoadPackage.LoadPackageParam lpparam) {
-
+    public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) {
         if (!TARGET_PACKAGES.contains(lpparam.packageName)) {
             return;
         }
 
-        final String packageName =
-                lpparam.packageName;
-
-        XposedBridge.log(
-                "[TransparentTelegram] Loading: "
-                        + packageName
-        );
+        final String packageName = lpparam.packageName;
+        XposedBridge.log("[TransparentTelegram] Loading: " + packageName);
 
         try {
+            Class<?> launchActivityClass = XposedHelpers.findClass(
+                    LAUNCH_ACTIVITY_CLASS, lpparam.classLoader);
 
-            /*
-             * ----------------------------------------------------
-             * Hook View backgrounds
-             * ----------------------------------------------------
-             *
-             * Здесь мы специально перехватываем только:
-             *
-             * 1. DecorView
-             * 2. Telegram blur drawable
-             *
-             * Остальные View НЕ изменяются.
-             */
-
-            hookViewBackgrounds();
-
-            /*
-             * ----------------------------------------------------
-             * LaunchActivity
-             * ----------------------------------------------------
-             */
-
-            Class<?> launchActivityClass =
-                    XposedHelpers.findClass(
-                            LAUNCH_ACTIVITY_CLASS,
-                            lpparam.classLoader
-                    );
-
-            /*
-             * ====================================================
-             * onCreate
-             * ====================================================
-             */
-
-            XposedHelpers.findAndHookMethod(
-                    launchActivityClass,
-                    "onCreate",
-                    Bundle.class,
+            XposedHelpers.findAndHookMethod(launchActivityClass, "onCreate", Bundle.class,
                     new XC_MethodHook() {
-
                         @Override
-                        protected void beforeHookedMethod(
-                                MethodHookParam param) {
-
+                        protected void beforeHookedMethod(MethodHookParam param) {
                             try {
-
-                                Activity activity =
-                                        (Activity) param.thisObject;
-
-                                prepareWindow(activity);
-
-                                XposedBridge.log(
-                                        "[TransparentTelegram] "
-                                                + "Window prepared: "
-                                                + packageName
-                                );
-
+                                prepareWindow((Activity) param.thisObject);
+                                XposedBridge.log("[TransparentTelegram] Window prepared: " + packageName);
                             } catch (Throwable t) {
-
-                                XposedBridge.log(
-                                        "[TransparentTelegram] "
-                                                + "before onCreate failed: "
-                                                + t
-                                );
+                                XposedBridge.log("[TransparentTelegram] before onCreate failed: " + t);
                             }
                         }
 
                         @Override
-                        protected void afterHookedMethod(
-                                MethodHookParam param) {
-
+                        protected void afterHookedMethod(MethodHookParam param) {
                             try {
-
-                                Activity activity =
-                                        (Activity) param.thisObject;
-
-                                applyTransparency(activity);
-
+                                applyTransparency((Activity) param.thisObject);
                             } catch (Throwable t) {
-
-                                XposedBridge.log(
-                                        "[TransparentTelegram] "
-                                                + "after onCreate failed: "
-                                                + t
-                                );
+                                XposedBridge.log("[TransparentTelegram] after onCreate failed: " + t);
                             }
                         }
-                    }
-            );
+                    });
 
-            /*
-             * ====================================================
-             * onResume
-             * ====================================================
-             */
-
-            XposedHelpers.findAndHookMethod(
-                    launchActivityClass,
-                    "onResume",
+            XposedHelpers.findAndHookMethod(launchActivityClass, "onResume",
                     new XC_MethodHook() {
-
                         @Override
-                        protected void afterHookedMethod(
-                                MethodHookParam param) {
-
-                            final Activity activity =
-                                    (Activity) param.thisObject;
-
+                        protected void afterHookedMethod(MethodHookParam param) {
+                            final Activity activity = (Activity) param.thisObject;
                             try {
-
                                 applyTransparency(activity);
-
                             } catch (Throwable t) {
-
-                                XposedBridge.log(
-                                        "[TransparentTelegram] "
-                                                + "onResume failed: "
-                                                + t
-                                );
+                                XposedBridge.log("[TransparentTelegram] onResume failed: " + t);
                             }
 
-                            /*
-                             * Telegram может восстановить фон
-                             * после layout/resume.
-                             *
-                             * Поэтому повторяем только очистку
-                             * DecorView и blur.
-                             */
-
-                            scheduleApply(
-                                    activity,
-                                    100
-                            );
-
-                            scheduleApply(
-                                    activity,
-                                    500
-                            );
-
-                            scheduleApply(
-                                    activity,
-                                    1000
-                            );
-
-                            scheduleApply(
-                                    activity,
-                                    2000
-                            );
-
-                            scheduleApply(
-                                    activity,
-                                    3000
-                            );
-
-                            /*
-                             * Диагностика.
-                             */
-
+                            // диагностический дамп -- один раз за процесс, с задержкой,
+                            // чтобы дать Telegram доиграть свою асинхронную инициализацию
                             if (!diagnosticsDumped) {
-
                                 diagnosticsDumped = true;
-
-                                MAIN_HANDLER.postDelayed(
-                                        new Runnable() {
-
-                                            @Override
-                                            public void run() {
-
-                                                try {
-
-                                                    dumpDiagnostics(
-                                                            activity
-                                                    );
-
-                                                } catch (Throwable t) {
-
-                                                    XposedBridge.log(
-                                                            "[TransparentTelegram]"
-                                                                    + "[DIAG] "
-                                                                    + "dump failed: "
-                                                                    + t
-                                                    );
-                                                }
-                                            }
-                                        },
-                                        1500
-                                );
+                                new Handler(Looper.getMainLooper()).postDelayed(new Runnable() {
+                                    @Override
+                                    public void run() {
+                                        try {
+                                            dumpDiagnostics(activity);
+                                        } catch (Throwable t) {
+                                            XposedBridge.log("[TransparentTelegram][DIAG] dump failed: " + t);
+                                        }
+                                    }
+                                }, 1500);
                             }
                         }
-                    }
-            );
+                    });
 
-            XposedBridge.log(
-                    "[TransparentTelegram] "
-                            + "Hooks installed for "
-                            + packageName
-            );
-
+            XposedBridge.log("[TransparentTelegram] Hooks installed for " + packageName);
         } catch (Throwable t) {
-
-            XposedBridge.log(
-                    "[TransparentTelegram] "
-                            + "Failed for "
-                            + packageName
-                            + ": "
-                            + t
-            );
+            XposedBridge.log("[TransparentTelegram] Failed for " + packageName + ": " + t);
         }
     }
 
-    /*
-     * ============================================================
-     * HOOK VIEW BACKGROUNDS
-     * ============================================================
-     */
-
-    private void hookViewBackgrounds() {
-
-        try {
-
-            /*
-             * ----------------------------------------------------
-             * setBackground(Drawable)
-             * ----------------------------------------------------
-             */
-
-            XposedHelpers.findAndHookMethod(
-                    View.class,
-                    "setBackground",
-                    Drawable.class,
-                    new XC_MethodHook() {
-
-                        @Override
-                        protected void beforeHookedMethod(
-                                MethodHookParam param) {
-
-                            try {
-
-                                View view =
-                                        (View) param.thisObject;
-
-                                Drawable drawable =
-                                        (Drawable) param.args[0];
-
-                                /*
-                                 * DecorView
-                                 */
-
-                                if (isDecorView(view)) {
-
-                                    param.args[0] =
-                                            new ColorDrawable(
-                                                    Color.TRANSPARENT
-                                            );
-
-                                    XposedBridge.log(
-                                            "[TransparentTelegram] "
-                                                    + "Blocked DecorView "
-                                                    + "background"
-                                    );
-
-                                    return;
-                                }
-
-                                /*
-                                 * Telegram blur
-                                 */
-
-                                if (isTelegramBlur(drawable)) {
-
-                                    disableBlurDrawable(
-                                            drawable
-                                    );
-
-                                    XposedBridge.log(
-                                            "[TransparentTelegram] "
-                                                    + "Blocked blur drawable: "
-                                                    + view.getClass().getName()
-                                                    + " size="
-                                                    + view.getWidth()
-                                                    + "x"
-                                                    + view.getHeight()
-                                    );
-                                }
-
-                            } catch (Throwable t) {
-
-                                XposedBridge.log(
-                                        "[TransparentTelegram] "
-                                                + "setBackground hook failed: "
-                                                + t
-                                );
-                            }
-                        }
-                    }
-            );
-
-            /*
-             * ----------------------------------------------------
-             * setBackgroundDrawable(Drawable)
-             * ----------------------------------------------------
-             *
-             * Некоторые версии Android/Telegram используют
-             * именно deprecated-метод.
-             */
-
-            XposedHelpers.findAndHookMethod(
-                    View.class,
-                    "setBackgroundDrawable",
-                    Drawable.class,
-                    new XC_MethodHook() {
-
-                        @Override
-                        protected void beforeHookedMethod(
-                                MethodHookParam param) {
-
-                            try {
-
-                                View view =
-                                        (View) param.thisObject;
-
-                                Drawable drawable =
-                                        (Drawable) param.args[0];
-
-                                /*
-                                 * DecorView
-                                 */
-
-                                if (isDecorView(view)) {
-
-                                    param.args[0] =
-                                            new ColorDrawable(
-                                                    Color.TRANSPARENT
-                                            );
-
-                                    XposedBridge.log(
-                                            "[TransparentTelegram] "
-                                                    + "Blocked DecorView "
-                                                    + "background"
-                                    );
-
-                                    return;
-                                }
-
-                                /*
-                                 * Telegram blur
-                                 */
-
-                                if (isTelegramBlur(drawable)) {
-
-                                    disableBlurDrawable(
-                                            drawable
-                                    );
-
-                                    XposedBridge.log(
-                                            "[TransparentTelegram] "
-                                                    + "Blocked blur drawable: "
-                                                    + view.getClass().getName()
-                                                    + " size="
-                                                    + view.getWidth()
-                                                    + "x"
-                                                    + view.getHeight()
-                                    );
-                                }
-
-                            } catch (Throwable t) {
-
-                                XposedBridge.log(
-                                        "[TransparentTelegram] "
-                                                + "setBackgroundDrawable "
-                                                + "hook failed: "
-                                                + t
-                                );
-                            }
-                        }
-                    }
-            );
-
-            /*
-             * ----------------------------------------------------
-             * setBackgroundColor(int)
-             * ----------------------------------------------------
-             *
-             * Это особенно важно, потому что твой DIAG показывает:
-             *
-             * DecorView
-             * bg=ColorDrawable(#80000000)
-             *
-             * Значит Telegram или Android может снова вызывать
-             * setBackgroundColor().
-             */
-
-            XposedHelpers.findAndHookMethod(
-                    View.class,
-                    "setBackgroundColor",
-                    int.class,
-                    new XC_MethodHook() {
-
-                        @Override
-                        protected void beforeHookedMethod(
-                                MethodHookParam param) {
-
-                            try {
-
-                                View view =
-                                        (View) param.thisObject;
-
-                                if (isDecorView(view)) {
-
-                                    int oldColor =
-                                            (Integer) param.args[0];
-
-                                    param.args[0] =
-                                            Color.TRANSPARENT;
-
-                                    XposedBridge.log(
-                                            "[TransparentTelegram] "
-                                                    + "Blocked DecorView "
-                                                    + "color #"
-                                                    + String.format(
-                                                            "%08X",
-                                                            oldColor
-                                                    )
-                                    );
-                                }
-
-                            } catch (Throwable t) {
-
-                                XposedBridge.log(
-                                        "[TransparentTelegram] "
-                                                + "setBackgroundColor "
-                                                + "hook failed: "
-                                                + t
-                                );
-                            }
-                        }
-                    }
-            );
-
-            XposedBridge.log(
-                    "[TransparentTelegram] "
-                            + "View background hooks installed"
-            );
-
-        } catch (Throwable t) {
-
-            XposedBridge.log(
-                    "[TransparentTelegram] "
-                            + "Failed to hook View backgrounds: "
-                            + t
-            );
-        }
+    private void prepareWindow(Activity activity) {
+        Window window = activity.getWindow();
+        window.setFormat(PixelFormat.TRANSLUCENT);
+        window.addFlags(WindowManager.LayoutParams.FLAG_SHOW_WALLPAPER);
+        window.setDimAmount(0f);
+        window.setBackgroundDrawable(new ColorDrawable(WINDOW_BACKGROUND_COLOR));
     }
 
-    /*
-     * ============================================================
-     * DECOR VIEW CHECK
-     * ============================================================
-     */
-
-    private boolean isDecorView(
-            View view) {
-
-        if (view == null) {
-            return false;
-        }
-
-        String className =
-                view.getClass().getName();
-
-        return className.equals(
-                "com.android.internal.policy.DecorView"
-        );
-    }
-
-    /*
-     * ============================================================
-     * TELEGRAM BLUR CHECK
-     * ============================================================
-     */
-
-    private boolean isTelegramBlur(
-            Drawable drawable) {
-
-        if (drawable == null) {
-            return false;
-        }
-
-        String className =
-                drawable.getClass().getName();
-
-        /*
-         * Именно тот drawable, который виден
-         * в твоём DIAG:
-         *
-         * org.telegram.ui.Components.blur3.
-         * BlurredBackgroundWithFadeDrawable
-         */
-
-        return className.contains(
-                "BlurredBackgroundWithFadeDrawable"
-        );
-    }
-
-    /*
-     * ============================================================
-     * DISABLE BLUR
-     * ============================================================
-     */
-
-    private void disableBlurDrawable(
-            Drawable drawable) {
-
-        if (drawable == null) {
+    private void applyTransparency(final Activity activity) {
+        if (activity == null || activity.isFinishing()) {
             return;
         }
 
-        try {
+        final Window window = activity.getWindow();
+        window.setFormat(PixelFormat.TRANSLUCENT);
+        window.addFlags(WindowManager.LayoutParams.FLAG_SHOW_WALLPAPER);
+        window.setDimAmount(0f);
+        window.setBackgroundDrawable(new ColorDrawable(WINDOW_BACKGROUND_COLOR));
 
-            /*
-             * Не заменяем Drawable.
-             *
-             * Просто выключаем его отрисовку.
-             */
-
-            drawable.mutate();
-
-            drawable.setAlpha(0);
-
-        } catch (Throwable t) {
-
-            XposedBridge.log(
-                    "[TransparentTelegram] "
-                            + "Failed to disable blur: "
-                            + t
-            );
-        }
-    }
-
-    /*
-     * ============================================================
-     * PREPARE WINDOW
-     * ============================================================
-     */
-
-    private void prepareWindow(
-            Activity activity) {
-
-        if (activity == null) {
-            return;
-        }
-
-        try {
-
-            Window window =
-                    activity.getWindow();
-
-            window.setFormat(
-                    PixelFormat.TRANSLUCENT
-            );
-
-            window.addFlags(
-                    WindowManager.LayoutParams.FLAG_SHOW_WALLPAPER
-            );
-
-            window.setDimAmount(0f);
-
-            window.setBackgroundDrawable(
-                    new ColorDrawable(
-                            Color.TRANSPARENT
-                    )
-            );
-
-        } catch (Throwable t) {
-
-            XposedBridge.log(
-                    "[TransparentTelegram] "
-                            + "prepareWindow failed: "
-                            + t
-            );
-        }
-    }
-
-    /*
-     * ============================================================
-     * APPLY TRANSPARENCY
-     * ============================================================
-     */
-
-    private void applyTransparency(
-            final Activity activity) {
-
-        if (activity == null ||
-                activity.isFinishing()) {
-
-            return;
-        }
-
-        try {
-
-            Window window =
-                    activity.getWindow();
-
-            window.setFormat(
-                    PixelFormat.TRANSLUCENT
-            );
-
-            window.addFlags(
-                    WindowManager.LayoutParams.FLAG_SHOW_WALLPAPER
-            );
-
-            window.setDimAmount(0f);
-
-            /*
-             * Само окно прозрачное.
-             */
-
-            window.setBackgroundDrawable(
-                    new ColorDrawable(
-                            Color.TRANSPARENT
-                    )
-            );
-
-            final View root =
-                    window.getDecorView();
-
-            if (root == null) {
-                return;
-            }
-
-            /*
-             * Принудительно очищаем DecorView.
-             */
-
-            forceTransparentDecor(
-                    root
-            );
-
-            /*
-             * Проходим дерево только для поиска
-             * BlurredBackgroundWithFadeDrawable.
-             *
-             * Никаких полноэкранных ColorDrawable
-             * больше не трогаем.
-             */
-
-            root.post(
-                    new Runnable() {
-
-                        @Override
-                        public void run() {
-
-                            try {
-
-                                scanForBlur(
-                                        root,
-                                        0
-                                );
-
-                                forceTransparentDecor(
-                                        root
-                                );
-
-                            } catch (Throwable t) {
-
-                                XposedBridge.log(
-                                        "[TransparentTelegram] "
-                                                + "scan failed: "
-                                                + t
-                                );
-                            }
-                        }
-                    }
-            );
-
-            XposedBridge.log(
-                    "[TransparentTelegram] "
-                            + "Transparency applied"
-            );
-
-        } catch (Throwable t) {
-
-            XposedBridge.log(
-                    "[TransparentTelegram] "
-                            + "applyTransparency failed: "
-                            + t
-            );
-        }
-    }
-
-    /*
-     * ============================================================
-     * FORCE TRANSPARENT DECOR
-     * ============================================================
-     */
-
-    private void forceTransparentDecor(
-            View root) {
-
-        if (root == null) {
-            return;
-        }
-
-        try {
-
-            if (isDecorView(root)) {
-
-                Drawable background =
-                        root.getBackground();
-
-                /*
-                 * Если уже прозрачный — ничего не делаем.
-                 */
-
-                if (background instanceof ColorDrawable) {
-
-                    int color =
-                            ((ColorDrawable)
-                                    background)
-                                    .getColor();
-
-                    if (Color.alpha(color) == 0) {
-                        return;
+        final View root = window.getDecorView();
+        if (root != null) {
+            // .post() -- выполнится ПОСЛЕ того, как View пройдут layout,
+            // иначе getWidth()/getHeight() ещё вернут 0 и фильтр по
+            // размеру в stripOpaqueBackgrounds отсеет всё подряд.
+            root.post(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        stripOpaqueBackgrounds(root, root.getWidth(), root.getHeight(), 0);
+                    } catch (Throwable t) {
+                        XposedBridge.log("[TransparentTelegram] stripOpaqueBackgrounds failed: " + t);
                     }
                 }
-
-                /*
-                 * Меняем именно DecorView.
-                 */
-
-                root.setBackground(
-                        new ColorDrawable(
-                                Color.TRANSPARENT
-                        )
-                );
-
-                root.invalidate();
-
-                XposedBridge.log(
-                        "[TransparentTelegram] "
-                                + "DecorView forced transparent"
-                );
-            }
-
-        } catch (Throwable t) {
-
-            XposedBridge.log(
-                    "[TransparentTelegram] "
-                            + "force DecorView failed: "
-                            + t
-            );
+            });
         }
+
+        XposedBridge.log("[TransparentTelegram] Transparency applied");
     }
 
-    /*
-     * ============================================================
-     * SCAN FOR BLUR
-     * ============================================================
+    /**
+     * ГЛУБОКИЙ обход дерева View (в отличие от прежней версии, которая
+     * трогала только 1-2 верхних уровня). Найдено по реальным логам с
+     * устройства: настоящая "стена" -- org.telegram.ui.MainTabsActivity$2
+     * с ColorDrawable(#FF212332, alpha=255), на 8 уровней глубже
+     * DecorView, размером ровно во весь экран.
+     *
+     * Критерий отбора: непрозрачный фон (alpha==255 либо
+     * Drawable.getOpacity()==OPAQUE) И размер вида ~= размеру экрана
+     * (>=85% ширины и высоты DecorView). Это отсекает кнопки/пузыри
+     * сообщений/карточки -- у них обычно осмысленный сплошной цвет
+     * меньшего размера, трогать их не нужно (испортит читаемость чата).
+     *
+     * Через Drawable.setAlpha() (а не создание нового ColorDrawable через
+     * setBackgroundColor) -- это работает для ЛЮБого типа Drawable, включая
+     * NinePatchDrawable/BitmapDrawable (например обои чата), не только
+     * для сплошных цветов. mutate() обязателен, чтобы не задеть другие
+     * View, которые могут шарить тот же закэшированный Drawable.
      */
-
-    private void scanForBlur(
-            View view,
-            int depth) {
-
-        if (view == null) {
+    private void stripOpaqueBackgrounds(View view, int rootWidth, int rootHeight, int depth) {
+        if (view == null || depth > 40) { // защита от аномально глубоких/циклических деревьев
             return;
         }
 
-        if (depth > MAX_DEPTH) {
-            return;
-        }
-
-        try {
-
-            Drawable background =
-                    view.getBackground();
-
-            if (isTelegramBlur(background)) {
-
-                disableBlurDrawable(
-                        background
-                );
-
-                view.invalidate();
-
-                XposedBridge.log(
-                        "[TransparentTelegram] "
-                                + "Blocked blur drawable: "
-                                + view.getClass().getName()
-                                + " size="
-                                + view.getWidth()
-                                + "x"
-                                + view.getHeight()
-                );
-            }
-
-            /*
-             * Никакие другие background здесь НЕ трогаем.
-             */
-
-            if (view instanceof ViewGroup) {
-
-                ViewGroup group =
-                        (ViewGroup) view;
-
-                int count =
-                        group.getChildCount();
-
-                for (int i = 0;
-                     i < count;
-                     i++) {
-
-                    scanForBlur(
-                            group.getChildAt(i),
-                            depth + 1
-                    );
-                }
-            }
-
-        } catch (Throwable t) {
-
-            XposedBridge.log(
-                    "[TransparentTelegram] "
-                            + "scan node failed: "
-                            + view.getClass().getName()
-                            + ": "
-                            + t
-            );
-        }
-    }
-
-    /*
-     * ============================================================
-     * DELAYED APPLY
-     * ============================================================
-     */
-
-    private void scheduleApply(
-            final Activity activity,
-            long delay) {
-
-        if (activity == null) {
-            return;
-        }
-
-        MAIN_HANDLER.postDelayed(
-                new Runnable() {
-
-                    @Override
-                    public void run() {
-
-                        try {
-
-                            applyTransparency(
-                                    activity
-                            );
-
-                        } catch (Throwable t) {
-
-                            XposedBridge.log(
-                                    "[TransparentTelegram] "
-                                            + "delayed apply failed: "
-                                            + t
-                            );
-                        }
+        Drawable bg = view.getBackground();
+        if (bg != null && isEffectivelyOpaque(bg)) {
+            boolean fullWidth = view.getWidth() >= rootWidth * 0.85f;
+            boolean fullHeight = view.getHeight() >= rootHeight * 0.85f;
+            if (fullWidth && fullHeight) {
+                try {
+                    if (bg instanceof ColorDrawable) {
+                        // ЗАМЕНЯЕМ цвет целиком на единый фиксированный тон
+                        // (как в оригинальном патче: android:windowBackground
+                        // жёстко заменили на #80000000, а не просто снизили
+                        // альфу исходному белому/светлому цвету). Если вместо
+                        // этого просто снижать альфу СВЕТЛОМУ фону (список
+                        // чатов в светлой теме и т.п.) -- получается "пересвеченное"
+                        // мутно-белое стекло поверх обоины, а не аккуратный
+                        // тёмный тон, как в чате.
+                        view.setBackgroundColor(WINDOW_BACKGROUND_COLOR);
+                    } else {
+                        // Для НЕ-сплошного фона (обои чата, паттерны, битмапы) --
+                        // заменить целиком нельзя, там важна сама картинка, поэтому
+                        // просто снижаем альфу как раньше.
+                        bg.mutate().setAlpha(ALPHA);
                     }
-                },
-                delay
-        );
-    }
-
-    /*
-     * ============================================================
-     * DIAGNOSTICS
-     * ============================================================
-     */
-
-    private void dumpDiagnostics(
-            Activity activity) {
-
-        if (activity == null ||
-                activity.isFinishing()) {
-
-            XposedBridge.log(
-                    "[TransparentTelegram][DIAG] "
-                            + "activity null/finishing"
-            );
-
-            return;
-        }
-
-        try {
-
-            Window window =
-                    activity.getWindow();
-
-            WindowManager.LayoutParams attrs =
-                    window.getAttributes();
-
-            XposedBridge.log(
-                    "[TransparentTelegram][DIAG] "
-                            + "===== DUMP START ====="
-            );
-
-            XposedBridge.log(
-                    "[TransparentTelegram][DIAG] "
-                            + "activity="
-                            + activity.getClass().getName()
-            );
-
-            XposedBridge.log(
-                    "[TransparentTelegram][DIAG] "
-                            + "window.flags=0x"
-                            + Integer.toHexString(
-                                    attrs.flags
-                            )
-                            + " FLAG_SHOW_WALLPAPER="
-                            + (
-                                    (attrs.flags
-                                            & WindowManager.LayoutParams
-                                            .FLAG_SHOW_WALLPAPER)
-                                            != 0
-                            )
-            );
-
-            XposedBridge.log(
-                    "[TransparentTelegram][DIAG] "
-                            + "window.dimAmount="
-                            + attrs.dimAmount
-            );
-
-            XposedBridge.log(
-                    "[TransparentTelegram][DIAG] "
-                            + "window.alpha="
-                            + attrs.alpha
-            );
-
-            View decor =
-                    window.getDecorView();
-
-            XposedBridge.log(
-                    "[TransparentTelegram][DIAG] "
-                            + "decorView background="
-                            + describeDrawable(
-                                    decor.getBackground()
-                            )
-            );
-
-            XposedBridge.log(
-                    "[TransparentTelegram][DIAG] "
-                            + "decorView alpha="
-                            + decor.getAlpha()
-                            + " visibility="
-                            + visibilityToString(
-                                    decor.getVisibility()
-                            )
-                            + " size="
-                            + decor.getWidth()
-                            + "x"
-                            + decor.getHeight()
-            );
-
-            dumpViewTreeDiagnostics(
-                    decor,
-                    0
-            );
-
-            XposedBridge.log(
-                    "[TransparentTelegram][DIAG] "
-                            + "===== DUMP END ====="
-            );
-
-        } catch (Throwable t) {
-
-            XposedBridge.log(
-                    "[TransparentTelegram][DIAG] "
-                            + "failed: "
-                            + t
-            );
-        }
-    }
-
-    /*
-     * ============================================================
-     * DIAGNOSTIC TREE
-     * ============================================================
-     */
-
-    private void dumpViewTreeDiagnostics(
-            View view,
-            int depth) {
-
-        if (view == null) {
-            return;
-        }
-
-        if (depth > MAX_DEPTH) {
-            return;
-        }
-
-        try {
-
-            StringBuilder indent =
-                    new StringBuilder();
-
-            for (int i = 0;
-                 i < depth;
-                 i++) {
-
-                indent.append("  ");
-            }
-
-            String line =
-                    indent
-                            + "["
-                            + depth
-                            + "] "
-                            + view.getClass().getName()
-                            + " bg="
-                            + describeDrawable(
-                                    view.getBackground()
-                            )
-                            + " alpha="
-                            + view.getAlpha()
-                            + " vis="
-                            + visibilityToString(
-                                    view.getVisibility()
-                            )
-                            + " size="
-                            + view.getWidth()
-                            + "x"
-                            + view.getHeight()
-                            + " top="
-                            + view.getTop()
-                            + " bottom="
-                            + view.getBottom();
-
-            XposedBridge.log(
-                    "[TransparentTelegram][DIAG] "
-                            + line
-            );
-
-            if (view instanceof ViewGroup) {
-
-                ViewGroup group =
-                        (ViewGroup) view;
-
-                int childCount =
-                        group.getChildCount();
-
-                int count =
-                        Math.min(
-                                childCount,
-                                MAX_CHILDREN
-                        );
-
-                for (int i = 0;
-                     i < count;
-                     i++) {
-
-                    dumpViewTreeDiagnostics(
-                            group.getChildAt(i),
-                            depth + 1
-                    );
-                }
-
-                if (childCount > MAX_CHILDREN) {
-
-                    XposedBridge.log(
-                            "[TransparentTelegram][DIAG] "
-                                    + indent
-                                    + "  ... "
-                                    + (
-                                            childCount
-                                                    - MAX_CHILDREN
-                                    )
-                                    + " children hidden"
-                    );
+                    XposedBridge.log("[TransparentTelegram] Стена найдена и пробита: "
+                            + view.getClass().getName() + " (" + view.getWidth() + "x" + view.getHeight() + ")");
+                } catch (Throwable t) {
+                    XposedBridge.log("[TransparentTelegram] patch failed on "
+                            + view.getClass().getName() + ": " + t);
                 }
             }
+        }
 
-        } catch (Throwable t) {
-
-            XposedBridge.log(
-                    "[TransparentTelegram][DIAG] "
-                            + "node failed: "
-                            + t
-            );
+        if (view instanceof ViewGroup) {
+            ViewGroup group = (ViewGroup) view;
+            int count = group.getChildCount();
+            for (int i = 0; i < count; i++) {
+                stripOpaqueBackgrounds(group.getChildAt(i), rootWidth, rootHeight, depth + 1);
+            }
         }
     }
 
-    /*
-     * ============================================================
-     * DRAWABLE DESCRIPTION
-     * ============================================================
-     */
+    private boolean isEffectivelyOpaque(Drawable d) {
+        if (d instanceof ColorDrawable) {
+            return Color.alpha(((ColorDrawable) d).getColor()) == 255;
+        }
+        return d.getOpacity() == PixelFormat.OPAQUE;
+    }
 
-    private String describeDrawable(
-            Drawable drawable) {
+    // ==================== ДИАГНОСТИКА ====================
 
-        if (drawable == null) {
+    private void dumpDiagnostics(Activity activity) {
+        if (activity == null || activity.isFinishing()) {
+            XposedBridge.log("[TransparentTelegram][DIAG] activity is null/finishing, skip");
+            return;
+        }
+
+        Window window = activity.getWindow();
+        WindowManager.LayoutParams attrs = window.getAttributes();
+
+        XposedBridge.log("[TransparentTelegram][DIAG] ===== DUMP START =====");
+        XposedBridge.log("[TransparentTelegram][DIAG] activity=" + activity.getClass().getName());
+        XposedBridge.log("[TransparentTelegram][DIAG] window.flags=0x" + Integer.toHexString(attrs.flags)
+                + " (FLAG_SHOW_WALLPAPER set=" + ((attrs.flags & WindowManager.LayoutParams.FLAG_SHOW_WALLPAPER) != 0) + ")");
+        XposedBridge.log("[TransparentTelegram][DIAG] window.dimAmount=" + attrs.dimAmount);
+        XposedBridge.log("[TransparentTelegram][DIAG] window.alpha=" + attrs.alpha);
+
+        View decor = window.getDecorView();
+        XposedBridge.log("[TransparentTelegram][DIAG] decorView background=" + describeDrawable(decor.getBackground()));
+        XposedBridge.log("[TransparentTelegram][DIAG] decorView alpha=" + decor.getAlpha()
+                + " visibility=" + decor.getVisibility());
+
+        dumpViewTree(decor, 0);
+
+        XposedBridge.log("[TransparentTelegram][DIAG] ===== DUMP END =====");
+    }
+
+    private void dumpViewTree(View view, int depth) {
+        if (view == null || depth > MAX_DEPTH) {
+            return;
+        }
+
+        StringBuilder indent = new StringBuilder();
+        for (int i = 0; i < depth; i++) {
+            indent.append("  ");
+        }
+
+        String line = indent + "[" + depth + "] " + view.getClass().getName()
+                + " bg=" + describeDrawable(view.getBackground())
+                + " alpha=" + view.getAlpha()
+                + " vis=" + visibilityToString(view.getVisibility())
+                + " size=" + view.getWidth() + "x" + view.getHeight();
+        XposedBridge.log("[TransparentTelegram][DIAG] " + line);
+
+        if (view instanceof ViewGroup) {
+            ViewGroup group = (ViewGroup) view;
+            int count = Math.min(group.getChildCount(), MAX_CHILDREN);
+            for (int i = 0; i < count; i++) {
+                dumpViewTree(group.getChildAt(i), depth + 1);
+            }
+            if (group.getChildCount() > MAX_CHILDREN) {
+                XposedBridge.log("[TransparentTelegram][DIAG] " + indent + "  ... ещё "
+                        + (group.getChildCount() - MAX_CHILDREN) + " детей не показано");
+            }
+        }
+    }
+
+    private String describeDrawable(Drawable d) {
+        if (d == null) {
             return "null";
         }
-
-        try {
-
-            if (drawable instanceof ColorDrawable) {
-
-                int color =
-                        ((ColorDrawable)
-                                drawable)
-                                .getColor();
-
-                return String.format(
-                        "ColorDrawable(#%08X, alpha=%d)",
-                        color,
-                        Color.alpha(color)
-                );
-            }
-
-            return drawable.getClass().getName()
-                    + " opacity="
-                    + drawable.getOpacity()
-                    + " alpha="
-                    + drawable.getAlpha();
-
-        } catch (Throwable t) {
-
-            return drawable.getClass().getName();
+        if (d instanceof ColorDrawable) {
+            int color = ((ColorDrawable) d).getColor();
+            return String.format("ColorDrawable(#%08X, alpha=%d)", color, Color.alpha(color));
         }
+        return d.getClass().getName() + " (opacity=" + d.getOpacity() + ", alpha=" + d.getAlpha() + ")";
     }
 
-    /*
-     * ============================================================
-     * VISIBILITY
-     * ============================================================
-     */
-
-    private String visibilityToString(
-            int visibility) {
-
-        switch (visibility) {
-
-            case View.VISIBLE:
-                return "VISIBLE";
-
-            case View.INVISIBLE:
-                return "INVISIBLE";
-
-            case View.GONE:
-                return "GONE";
-
-            default:
-                return String.valueOf(
-                        visibility
-                );
+    private String visibilityToString(int v) {
+        switch (v) {
+            case View.VISIBLE: return "VISIBLE";
+            case View.INVISIBLE: return "INVISIBLE";
+            case View.GONE: return "GONE";
+            default: return String.valueOf(v);
         }
     }
 }
