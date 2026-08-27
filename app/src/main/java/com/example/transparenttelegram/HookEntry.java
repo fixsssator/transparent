@@ -208,11 +208,26 @@ public class HookEntry implements IXposedHookLoadPackage {
             boolean fullHeight = view.getHeight() >= rootHeight * 0.85f;
             if (fullWidth && fullHeight) {
                 try {
-                    bg.mutate().setAlpha(ALPHA);
+                    if (bg instanceof ColorDrawable) {
+                        // ЗАМЕНЯЕМ цвет целиком на единый фиксированный тон
+                        // (как в оригинальном патче: android:windowBackground
+                        // жёстко заменили на #80000000, а не просто снизили
+                        // альфу исходному белому/светлому цвету). Если вместо
+                        // этого просто снижать альфу СВЕТЛОМУ фону (список
+                        // чатов в светлой теме и т.п.) -- получается "пересвеченное"
+                        // мутно-белое стекло поверх обоины, а не аккуратный
+                        // тёмный тон, как в чате.
+                        view.setBackgroundColor(WINDOW_BACKGROUND_COLOR);
+                    } else {
+                        // Для НЕ-сплошного фона (обои чата, паттерны, битмапы) --
+                        // заменить целиком нельзя, там важна сама картинка, поэтому
+                        // просто снижаем альфу как раньше.
+                        bg.mutate().setAlpha(ALPHA);
+                    }
                     XposedBridge.log("[TransparentTelegram] Стена найдена и пробита: "
                             + view.getClass().getName() + " (" + view.getWidth() + "x" + view.getHeight() + ")");
                 } catch (Throwable t) {
-                    XposedBridge.log("[TransparentTelegram] setAlpha failed on "
+                    XposedBridge.log("[TransparentTelegram] patch failed on "
                             + view.getClass().getName() + ": " + t);
                 }
             }
