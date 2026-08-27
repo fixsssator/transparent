@@ -63,6 +63,10 @@ public class HookEntry implements IXposedHookLoadPackage {
 
     private static final int ALPHA = 0x80;
     private static final int WINDOW_BACKGROUND_COLOR = Color.argb(ALPHA, 0, 0, 0);
+    // Блюр-плашки (BlurredBackgroundWithFadeDrawable и т.п.) под статус-баром/
+    // шапкой блюрят реальную обоину + свой fade-тон -- смотрится "пересвеченно",
+    // если оставить как есть. Приглушаем сильнее, чем обычную стену.
+    private static final int BLUR_ALPHA = 0x40;
     private static final int MAX_DEPTH = 8;      // насколько глубоко логируем дерево View
     private static final int MAX_CHILDREN = 6;   // максимум детей на уровень (чтобы не залить лог)
 
@@ -203,7 +207,25 @@ public class HookEntry implements IXposedHookLoadPackage {
         }
 
         Drawable bg = view.getBackground();
-        if (bg != null && isEffectivelyOpaque(bg)) {
+
+        if (bg != null && isBlurDrawable(bg)) {
+            // Отдельное правило ДО общей проверки на "во весь экран":
+            // блюр-плашки (BlurredBackgroundWithFadeDrawable и т.п.) обычно
+            // маленькие (полоска под статус-баром/шапкой) и НЕ считаются
+            // "непрозрачными" (opacity != OPAQUE) -- общий фильтр их не
+            // ловит. Раньше они блюрили обычный фон чата, теперь блюрят
+            // реальную обоину + свой fade-тон поверх -- визуально "пересвет".
+            // Приглушаем сильнее, чем обычную стену (BLUR_ALPHA < ALPHA).
+            try {
+                bg.mutate().setAlpha(BLUR_ALPHA);
+                XposedBridge.log("[TransparentTelegram] Блюр приглушён: "
+                        + view.getClass().getName() + " (" + bg.getClass().getName()
+                        + ", " + view.getWidth() + "x" + view.getHeight() + ")");
+            } catch (Throwable t) {
+                XposedBridge.log("[TransparentTelegram] blur patch failed on "
+                        + view.getClass().getName() + ": " + t);
+            }
+        } else if (bg != null && isEffectivelyOpaque(bg)) {
             boolean fullWidth = view.getWidth() >= rootWidth * 0.85f;
             boolean fullHeight = view.getHeight() >= rootHeight * 0.85f;
             if (fullWidth && fullHeight) {
@@ -247,6 +269,17 @@ public class HookEntry implements IXposedHookLoadPackage {
             return Color.alpha(((ColorDrawable) d).getColor()) == 255;
         }
         return d.getOpacity() == PixelFormat.OPAQUE;
+    }
+
+    /**
+     * Ловим блюр-дровейблы по имени класса, а не по opacity/размеру --
+     * они сами по себе полупрозрачные по задумке (opacity != OPAQUE),
+     * поэтому общий фильтр их пропускает, но визуально именно они дают
+     * "пересвеченный блюр" поверх живой обоины.
+     */
+    private boolean isBlurDrawable(Drawable d) {
+        String name = d.getClass().getName().toLowerCase();
+        return name.contains("blur");
     }
 
     // ==================== ДИАГНОСТИКА ====================
