@@ -1,0 +1,15 @@
+<resources>
+    <string name="app_name">Transparent Telegram (LSPosed)</string>
+    <string name="module_description">Делает окно Telegram-based приложений полупрозрачным (видны системные обои), воспроизводя эффект из патченной сборки: windowShowWallpaper + полупрозрачный windowBackground.</string>
+
+    <!-- Должен совпадать с HookEntry.TARGET_PACKAGES -->
+    <string-array name="target_packages">
+        <item>org.telegram.messenger</item>
+        <item>org.telegram.messenger.beta</item>
+        <item>org.telegram.messenger.web</item>
+        <item>com.radolyn.ayugram</item>
+        <item>com.radolyn.ayugram.web</item>
+        <item>tw.nekomimi.nekogram</item>
+        <item>nekox.messenger</item>
+    </string-array>
+</resources>
