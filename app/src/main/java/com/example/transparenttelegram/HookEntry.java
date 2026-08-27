@@ -147,41 +147,91 @@ public class HookEntry implements IXposedHookLoadPackage {
         window.setBackgroundDrawable(new ColorDrawable(WINDOW_BACKGROUND_COLOR));
     }
 
-    private void applyTransparency(Activity activity) {
+    private void applyTransparency(final Activity activity) {
         if (activity == null || activity.isFinishing()) {
             return;
         }
 
-        Window window = activity.getWindow();
+        final Window window = activity.getWindow();
         window.setFormat(PixelFormat.TRANSLUCENT);
         window.addFlags(WindowManager.LayoutParams.FLAG_SHOW_WALLPAPER);
         window.setDimAmount(0f);
         window.setBackgroundDrawable(new ColorDrawable(WINDOW_BACKGROUND_COLOR));
 
-        View root = window.getDecorView();
+        final View root = window.getDecorView();
         if (root != null) {
-            makeViewTransparent(root);
+            // .post() -- выполнится ПОСЛЕ того, как View пройдут layout,
+            // иначе getWidth()/getHeight() ещё вернут 0 и фильтр по
+            // размеру в stripOpaqueBackgrounds отсеет всё подряд.
+            root.post(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        stripOpaqueBackgrounds(root, root.getWidth(), root.getHeight(), 0);
+                    } catch (Throwable t) {
+                        XposedBridge.log("[TransparentTelegram] stripOpaqueBackgrounds failed: " + t);
+                    }
+                }
+            });
         }
 
         XposedBridge.log("[TransparentTelegram] Transparency applied");
     }
 
-    private void makeViewTransparent(View view) {
-        if (view == null) {
+    /**
+     * ГЛУБОКИЙ обход дерева View (в отличие от прежней версии, которая
+     * трогала только 1-2 верхних уровня). Найдено по реальным логам с
+     * устройства: настоящая "стена" -- org.telegram.ui.MainTabsActivity$2
+     * с ColorDrawable(#FF212332, alpha=255), на 8 уровней глубже
+     * DecorView, размером ровно во весь экран.
+     *
+     * Критерий отбора: непрозрачный фон (alpha==255 либо
+     * Drawable.getOpacity()==OPAQUE) И размер вида ~= размеру экрана
+     * (>=85% ширины и высоты DecorView). Это отсекает кнопки/пузыри
+     * сообщений/карточки -- у них обычно осмысленный сплошной цвет
+     * меньшего размера, трогать их не нужно (испортит читаемость чата).
+     *
+     * Через Drawable.setAlpha() (а не создание нового ColorDrawable через
+     * setBackgroundColor) -- это работает для ЛЮБого типа Drawable, включая
+     * NinePatchDrawable/BitmapDrawable (например обои чата), не только
+     * для сплошных цветов. mutate() обязателен, чтобы не задеть другие
+     * View, которые могут шарить тот же закэшированный Drawable.
+     */
+    private void stripOpaqueBackgrounds(View view, int rootWidth, int rootHeight, int depth) {
+        if (view == null || depth > 40) { // защита от аномально глубоких/циклических деревьев
             return;
         }
-        if (view.getBackground() != null) {
-            view.setBackgroundColor(Color.argb(ALPHA, 0, 0, 0));
-        }
-        if (view instanceof ViewGroup) {
-            ViewGroup group = (ViewGroup) view;
-            if (group.getChildCount() == 1) {
-                View child = group.getChildAt(0);
-                if (child instanceof ViewGroup) {
-                    child.setBackgroundColor(Color.argb(ALPHA, 0, 0, 0));
+
+        Drawable bg = view.getBackground();
+        if (bg != null && isEffectivelyOpaque(bg)) {
+            boolean fullWidth = view.getWidth() >= rootWidth * 0.85f;
+            boolean fullHeight = view.getHeight() >= rootHeight * 0.85f;
+            if (fullWidth && fullHeight) {
+                try {
+                    bg.mutate().setAlpha(ALPHA);
+                    XposedBridge.log("[TransparentTelegram] Стена найдена и пробита: "
+                            + view.getClass().getName() + " (" + view.getWidth() + "x" + view.getHeight() + ")");
+                } catch (Throwable t) {
+                    XposedBridge.log("[TransparentTelegram] setAlpha failed on "
+                            + view.getClass().getName() + ": " + t);
                 }
             }
         }
+
+        if (view instanceof ViewGroup) {
+            ViewGroup group = (ViewGroup) view;
+            int count = group.getChildCount();
+            for (int i = 0; i < count; i++) {
+                stripOpaqueBackgrounds(group.getChildAt(i), rootWidth, rootHeight, depth + 1);
+            }
+        }
+    }
+
+    private boolean isEffectivelyOpaque(Drawable d) {
+        if (d instanceof ColorDrawable) {
+            return Color.alpha(((ColorDrawable) d).getColor()) == 255;
+        }
+        return d.getOpacity() == PixelFormat.OPAQUE;
     }
 
     // ==================== ДИАГНОСТИКА ====================
