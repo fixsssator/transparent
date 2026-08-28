@@ -280,11 +280,19 @@ public class HookEntry implements IXposedHookLoadPackage {
             // "непрозрачными" (opacity != OPAQUE) -- общий фильтр их не
             // ловит. Раньше они блюрили обычный фон чата, теперь блюрят
             // реальную обоину + свой fade-тон поверх -- визуально "пересвет".
-            // Приглушаем сильнее, чем обычную стену (BLUR_ALPHA < ALPHA).
+            //
+            // ВАЖНО: просто bg.setAlpha(...) на самом composite-дровейбле
+            // не помогло на практике -- судя по названию "WithFade" у него
+            // внутри отдельный слой градиента-затухания со своей фиксированной
+            // альфой/цветом, который не подчиняется внешнему Drawable.setAlpha().
+            // Поэтому ПОЛНОСТЬЮ ЗАМЕНЯЕМ фон на простой ColorDrawable -- тот
+            // же приём, что уже надёжно работает для обычных "стен" ниже.
+            // Цена: пропадает сам эффект блюра позади шапки/поиска, остаётся
+            // ровный полупрозрачный тон -- визуально это лучше, чем "пересвет".
             try {
-                bg.mutate().setAlpha(BLUR_ALPHA);
-                XposedBridge.log("[TransparentTelegram] Блюр приглушён: "
-                        + view.getClass().getName() + " (" + bg.getClass().getName()
+                view.setBackgroundColor(WINDOW_BACKGROUND_COLOR);
+                XposedBridge.log("[TransparentTelegram] Блюр заменён на плоский тон: "
+                        + view.getClass().getName() + " (было " + bg.getClass().getName()
                         + ", " + view.getWidth() + "x" + view.getHeight() + ")");
             } catch (Throwable t) {
                 XposedBridge.log("[TransparentTelegram] blur patch failed on "
