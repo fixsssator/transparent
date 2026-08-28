@@ -149,6 +149,27 @@ public class HookEntry implements IXposedHookLoadPackage {
         window.addFlags(WindowManager.LayoutParams.FLAG_SHOW_WALLPAPER);
         window.setDimAmount(0f);
         window.setBackgroundDrawable(new ColorDrawable(WINDOW_BACKGROUND_COLOR));
+        clearSystemBars(window);
+    }
+
+    /**
+     * Статус-бар и навигационный бар Android рисует ОТДЕЛЬНО от DecorView
+     * (через WindowManager.LayoutParams.statusBarColor/navigationBarColor),
+     * это не View и не Drawable -- обход дерева (stripOpaqueBackgrounds)
+     * физически не может их достать. По скриншоту видно сплошную белую
+     * полосу ровно в области статус-бара -- это именно оно.
+     */
+    private void clearSystemBars(Window window) {
+        try {
+            window.setStatusBarColor(Color.TRANSPARENT);
+            window.setNavigationBarColor(Color.TRANSPARENT);
+            window.getDecorView().setSystemUiVisibility(
+                    View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+                            | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+                            | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION);
+        } catch (Throwable t) {
+            XposedBridge.log("[TransparentTelegram] clearSystemBars failed: " + t);
+        }
     }
 
     // Флаг на Activity: слушатель layout вешаем один раз за жизнь окна,
@@ -171,6 +192,7 @@ public class HookEntry implements IXposedHookLoadPackage {
         window.addFlags(WindowManager.LayoutParams.FLAG_SHOW_WALLPAPER);
         window.setDimAmount(0f);
         window.setBackgroundDrawable(new ColorDrawable(WINDOW_BACKGROUND_COLOR));
+        clearSystemBars(window);
 
         final View root = window.getDecorView();
         if (root == null) {
