@@ -151,6 +151,16 @@ public class HookEntry implements IXposedHookLoadPackage {
         window.setBackgroundDrawable(new ColorDrawable(WINDOW_BACKGROUND_COLOR));
     }
 
+    // Флаг на Activity: слушатель layout вешаем один раз за жизнь окна,
+    // а не при каждом applyTransparency() (иначе будут копиться дубликаты).
+    private static final java.util.WeakHashMap<View, Boolean> LISTENER_ATTACHED = new java.util.WeakHashMap<>();
+
+    // Троттлинг: layout в Android может дёргаться десятки раз в секунду
+    // (анимации, клавиатура, скролл) -- гонять полный обход дерева на
+    // каждый чих дорого и заспамит лог. Не чаще одного раза в 400 мс.
+    private static volatile long lastScanTime = 0L;
+    private static final long SCAN_THROTTLE_MS = 400L;
+
     private void applyTransparency(final Activity activity) {
         if (activity == null || activity.isFinishing()) {
             return;
@@ -163,20 +173,53 @@ public class HookEntry implements IXposedHookLoadPackage {
         window.setBackgroundDrawable(new ColorDrawable(WINDOW_BACKGROUND_COLOR));
 
         final View root = window.getDecorView();
-        if (root != null) {
-            // .post() -- выполнится ПОСЛЕ того, как View пройдут layout,
-            // иначе getWidth()/getHeight() ещё вернут 0 и фильтр по
-            // размеру в stripOpaqueBackgrounds отсеет всё подряд.
-            root.post(new Runnable() {
-                @Override
-                public void run() {
-                    try {
-                        stripOpaqueBackgrounds(root, root.getWidth(), root.getHeight(), 0);
-                    } catch (Throwable t) {
-                        XposedBridge.log("[TransparentTelegram] stripOpaqueBackgrounds failed: " + t);
-                    }
-                }
-            });
+        if (root == null) {
+            return;
+        }
+
+        // .post() -- выполнится ПОСЛЕ того, как View пройдут layout,
+        // иначе getWidth()/getHeight() ещё вернут 0 и фильтр по
+        // размеру в stripOpaqueBackgrounds отсеет всё подряд.
+        root.post(new Runnable() {
+            @Override
+            public void run() {
+                scanNow(root);
+            }
+        });
+
+        // ГЛАВНЫЙ ФИКС: Telegram -- однооконное приложение, переходы между
+        // экранами (Настройки, поиск, любой внутренний фрагмент) НЕ вызывают
+        // повторный onCreate/onResume самой Activity -- наш обход дерева
+        // просто никогда не запускался бы для этих экранов. Вешаем
+        // постоянный слушатель на изменения layout всего дерева -- он
+        // сработает при появлении/пересоздании ЛЮБОГО View, включая новые
+        // экраны, попапы, вкладки поиска и т.п. С троттлингом, чтобы не
+        // гонять полный обход на каждый мелкий layout (клавиатура, анимации).
+        synchronized (LISTENER_ATTACHED) {
+            if (!Boolean.TRUE.equals(LISTENER_ATTACHED.get(root))) {
+                LISTENER_ATTACHED.put(root, Boolean.TRUE);
+                root.getViewTreeObserver().addOnGlobalLayoutListener(
+                        new android.view.ViewTreeObserver.OnGlobalLayoutListener() {
+                            @Override
+                            public void onGlobalLayout() {
+                                long now = System.currentTimeMillis();
+                                if (now - lastScanTime < SCAN_THROTTLE_MS) {
+                                    return;
+                                }
+                                lastScanTime = now;
+                                scanNow(root);
+                            }
+                        });
+                XposedBridge.log("[TransparentTelegram] OnGlobalLayoutListener attached");
+            }
+        }
+    }
+
+    private void scanNow(View root) {
+        try {
+            stripOpaqueBackgrounds(root, root.getWidth(), root.getHeight(), 0);
+        } catch (Throwable t) {
+            XposedBridge.log("[TransparentTelegram] stripOpaqueBackgrounds failed: " + t);
         }
 
         XposedBridge.log("[TransparentTelegram] Transparency applied");
