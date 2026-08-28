@@ -6,8 +6,6 @@ import android.graphics.PixelFormat;
 import android.graphics.drawable.ColorDrawable;
 import android.graphics.drawable.Drawable;
 import android.os.Bundle;
-import android.os.Handler;
-import android.os.Looper;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.Window;
@@ -67,11 +65,8 @@ public class HookEntry implements IXposedHookLoadPackage {
     // шапкой блюрят реальную обоину + свой fade-тон -- смотрится "пересвеченно",
     // если оставить как есть. Приглушаем сильнее, чем обычную стену.
     private static final int BLUR_ALPHA = 0x40;
-    private static final int MAX_DEPTH = 8;      // насколько глубоко логируем дерево View
-    private static final int MAX_CHILDREN = 6;   // максимум детей на уровень (чтобы не залить лог)
-
-    // чтобы не дампить дерево при каждом onResume -- достаточно 1 раза за процесс
-    private static volatile boolean diagnosticsDumped = false;
+    private static final int MAX_DEPTH = 12;      // насколько глубоко логируем дерево View
+    private static final int MAX_CHILDREN = 12;   // максимум детей на уровень (чтобы не залить лог)
 
     @Override
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) {
@@ -117,22 +112,6 @@ public class HookEntry implements IXposedHookLoadPackage {
                                 applyTransparency(activity);
                             } catch (Throwable t) {
                                 XposedBridge.log("[TransparentTelegram] onResume failed: " + t);
-                            }
-
-                            // диагностический дамп -- один раз за процесс, с задержкой,
-                            // чтобы дать Telegram доиграть свою асинхронную инициализацию
-                            if (!diagnosticsDumped) {
-                                diagnosticsDumped = true;
-                                new Handler(Looper.getMainLooper()).postDelayed(new Runnable() {
-                                    @Override
-                                    public void run() {
-                                        try {
-                                            dumpDiagnostics(activity);
-                                        } catch (Throwable t) {
-                                            XposedBridge.log("[TransparentTelegram][DIAG] dump failed: " + t);
-                                        }
-                                    }
-                                }, 1500);
                             }
                         }
                     });
@@ -182,6 +161,13 @@ public class HookEntry implements IXposedHookLoadPackage {
     private static volatile long lastScanTime = 0L;
     private static final long SCAN_THROTTLE_MS = 400L;
 
+    // Диагностический дамп теперь ПОВТОРЯЕМЫЙ (не одноразовый), привязан
+    // к тому же слушателю layout, свой (более редкий) троттлинг -- чтобы
+    // при заходе на новый экран (Настройки и т.п.) в логе рано или поздно
+    // появился дамп именно оттуда, а не только с экрана при запуске.
+    private static volatile long lastDiagTime = 0L;
+    private static final long DIAG_THROTTLE_MS = 5000L;
+
     private void applyTransparency(final Activity activity) {
         if (activity == null || activity.isFinishing()) {
             return;
@@ -225,11 +211,18 @@ public class HookEntry implements IXposedHookLoadPackage {
                             @Override
                             public void onGlobalLayout() {
                                 long now = System.currentTimeMillis();
-                                if (now - lastScanTime < SCAN_THROTTLE_MS) {
-                                    return;
+                                if (now - lastScanTime >= SCAN_THROTTLE_MS) {
+                                    lastScanTime = now;
+                                    scanNow(root);
                                 }
-                                lastScanTime = now;
-                                scanNow(root);
+                                if (now - lastDiagTime >= DIAG_THROTTLE_MS) {
+                                    lastDiagTime = now;
+                                    try {
+                                        dumpDiagnostics(activity);
+                                    } catch (Throwable t) {
+                                        XposedBridge.log("[TransparentTelegram][DIAG] dump failed: " + t);
+                                    }
+                                }
                             }
                         });
                 XposedBridge.log("[TransparentTelegram] OnGlobalLayoutListener attached");
