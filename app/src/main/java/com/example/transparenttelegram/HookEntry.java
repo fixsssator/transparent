@@ -81,6 +81,32 @@ public class HookEntry implements IXposedHookLoadPackage {
             Class<?> launchActivityClass = XposedHelpers.findClass(
                     LAUNCH_ACTIVITY_CLASS, lpparam.classLoader);
 
+            // Отдельный, гораздо более точный хук: ActionBar.setBackgroundColor()
+            // ПЕРЕОПРЕДЕЛЁН и НЕ создаёт обычный background-Drawable (см. смали:
+            // просто сохраняет цвет в поле actionBarColor и красит Paint'ом в
+            // dispatchDraw()) -- поэтому обход дерева (stripOpaqueBackgrounds)
+            // его в принципе не видит, getBackground() всегда null. Ловим сам
+            // сеттер -- сработает для ЛЮБОГО экрана (Настройки, список чатов,
+            // чат), независимо от того, когда и сколько раз он вызывается.
+            try {
+                Class<?> actionBarClass = XposedHelpers.findClass(
+                        "org.telegram.ui.ActionBar.ActionBar", lpparam.classLoader);
+                XposedHelpers.findAndHookMethod(actionBarClass, "setBackgroundColor", int.class,
+                        new XC_MethodHook() {
+                            @Override
+                            protected void beforeHookedMethod(MethodHookParam param) {
+                                int original = (Integer) param.args[0];
+                                if (Color.alpha(original) == 255) {
+                                    int patched = (original & 0x00FFFFFF) | (ALPHA << 24);
+                                    param.args[0] = patched;
+                                }
+                            }
+                        });
+                XposedBridge.log("[TransparentTelegram] ActionBar.setBackgroundColor hook installed for " + packageName);
+            } catch (Throwable t) {
+                XposedBridge.log("[TransparentTelegram] ActionBar hook failed for " + packageName + ": " + t);
+            }
+
             XposedHelpers.findAndHookMethod(launchActivityClass, "onCreate", Bundle.class,
                     new XC_MethodHook() {
                         @Override
