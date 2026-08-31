@@ -99,6 +99,12 @@ public class HookEntry implements IXposedHookLoadPackage {
                                 if (Color.alpha(original) == 255) {
                                     int patched = (original & 0x00FFFFFF) | (ALPHA << 24);
                                     param.args[0] = patched;
+                                    XposedBridge.log("[TransparentTelegram] ActionBar.setBackgroundColor: "
+                                            + Integer.toHexString(original) + " -> " + Integer.toHexString(patched)
+                                            + " (instance " + param.thisObject.getClass().getName() + ")");
+                                } else {
+                                    XposedBridge.log("[TransparentTelegram] ActionBar.setBackgroundColor пропущен (уже не opaque): "
+                                            + Integer.toHexString(original));
                                 }
                             }
                         });
@@ -402,6 +408,8 @@ public class HookEntry implements IXposedHookLoadPackage {
         XposedBridge.log("[TransparentTelegram][DIAG] ===== DUMP END =====");
     }
 
+    private final int[] locBuf = new int[2];
+
     private void dumpViewTree(View view, int depth) {
         if (view == null || depth > MAX_DEPTH) {
             return;
@@ -412,11 +420,22 @@ public class HookEntry implements IXposedHookLoadPackage {
             indent.append("  ");
         }
 
+        int screenX = -1;
+        int screenY = -1;
+        try {
+            view.getLocationOnScreen(locBuf);
+            screenX = locBuf[0];
+            screenY = locBuf[1];
+        } catch (Throwable ignored) {
+        }
+
         String line = indent + "[" + depth + "] " + view.getClass().getName()
                 + " bg=" + describeDrawable(view.getBackground())
                 + " alpha=" + view.getAlpha()
                 + " vis=" + visibilityToString(view.getVisibility())
-                + " size=" + view.getWidth() + "x" + view.getHeight();
+                + " size=" + view.getWidth() + "x" + view.getHeight()
+                + " pos=(" + screenX + "," + screenY + ")-(" + (screenX + view.getWidth())
+                + "," + (screenY + view.getHeight()) + ")";
         XposedBridge.log("[TransparentTelegram][DIAG] " + line);
 
         if (view instanceof ViewGroup) {
