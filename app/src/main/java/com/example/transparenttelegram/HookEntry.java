@@ -113,6 +113,36 @@ public class HookEntry implements IXposedHookLoadPackage {
                 XposedBridge.log("[TransparentTelegram] ActionBar hook failed for " + packageName + ": " + t);
             }
 
+            // НОВЫЙ, современный механизм ("glass"-редизайн): ActionBar в
+            // этой версии красит себя НЕ через setBackgroundColor(), а через
+            // setupGlass(...)/setDrawBlurBackground(...), которые берут цвет
+            // из отдельного объекта BlurredBackgroundColorProvider (интерфейс
+            // с методом getBackgroundColor()) -- он опрашивается каждый раз
+            // при отрисовке блюра. Хук на setBackgroundColor его вообще не
+            // видит -- нужно ловить именно этот провайдер. Хукаем конкретную
+            // реализацию (интерфейсы напрямую не хукаются в classic Xposed API).
+            try {
+                Class<?> providerClass = XposedHelpers.findClass(
+                        "org.telegram.ui.Components.blur3.drawable.color.BlurredBackgroundColorProviderThemed",
+                        lpparam.classLoader);
+                XposedHelpers.findAndHookMethod(providerClass, "getBackgroundColor",
+                        new XC_MethodHook() {
+                            @Override
+                            protected void afterHookedMethod(MethodHookParam param) {
+                                int original = (Integer) param.getResult();
+                                if (Color.alpha(original) == 255) {
+                                    int patched = (original & 0x00FFFFFF) | (ALPHA << 24);
+                                    param.setResult(patched);
+                                    XposedBridge.log("[TransparentTelegram] BlurredBackgroundColorProviderThemed.getBackgroundColor: "
+                                            + Integer.toHexString(original) + " -> " + Integer.toHexString(patched));
+                                }
+                            }
+                        });
+                XposedBridge.log("[TransparentTelegram] BlurredBackgroundColorProviderThemed hook installed for " + packageName);
+            } catch (Throwable t) {
+                XposedBridge.log("[TransparentTelegram] BlurredBackgroundColorProviderThemed hook failed for " + packageName + ": " + t);
+            }
+
             XposedHelpers.findAndHookMethod(launchActivityClass, "onCreate", Bundle.class,
                     new XC_MethodHook() {
                         @Override

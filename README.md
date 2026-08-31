@@ -134,3 +134,17 @@ gradle assembleDebug
 переименовывают базовые классы. Если у какого-то клиента это не так —
 в логе LSPosed Manager -> Logs будет строка
 `[TransparentTelegram] failed for <package>: ...` с причиной.
+
+## "Glass"-редизайн (Telegram 12.10.x+)
+
+Начиная с этой версии часть заголовков (`ActionBar`) красится НЕ через
+`setBackgroundColor()`, а через новый механизм: `ActionBar.setupGlass(...)`
+/`setDrawBlurBackground(...)`, которые берут цвет из отдельного
+объекта-интерфейса `BlurredBackgroundColorProvider` (метод
+`getBackgroundColor()`), опрашиваемого при каждой перерисовке блюра.
+Хук на `setBackgroundColor` это не видит вообще. Ловим конкретную
+реализацию — `BlurredBackgroundColorProviderThemed.getBackgroundColor()`
+— и режем альфу возвращаемого цвета (интерфейсы напрямую хукать нельзя,
+только конкретные реализующие классы). Если в будущей версии появится
+ещё одна реализация интерфейса — её тоже нужно будет добавить отдельным
+хуком по тому же принципу.
