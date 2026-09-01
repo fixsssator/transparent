@@ -14,6 +14,7 @@ import android.view.WindowManager;
 import java.util.Arrays;
 import java.util.HashSet;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import de.robv.android.xposed.IXposedHookLoadPackage;
 import de.robv.android.xposed.XC_MethodHook;
@@ -58,6 +59,10 @@ public class HookEntry implements IXposedHookLoadPackage {
     ));
 
     private static final String LAUNCH_ACTIVITY_CLASS = "org.telegram.ui.LaunchActivity";
+
+    // Счётчик срабатываний диагностического хука Paint.setColor -- ограничиваем,
+    // чтобы не залить лог (setColor может вызываться тысячи раз за кадр).
+    private static final AtomicInteger paintDiagCount = new AtomicInteger(0);
 
     private static final int ALPHA = 0x80;
     private static final int WINDOW_BACKGROUND_COLOR = Color.argb(ALPHA, 0, 0, 0);
@@ -141,6 +146,52 @@ public class HookEntry implements IXposedHookLoadPackage {
                 XposedBridge.log("[TransparentTelegram] BlurredBackgroundColorProviderThemed hook installed for " + packageName);
             } catch (Throwable t) {
                 XposedBridge.log("[TransparentTelegram] BlurredBackgroundColorProviderThemed hook failed for " + packageName + ": " + t);
+            }
+
+            // ============================================================
+            // ВРЕМЕННЫЙ ДИАГНОСТИЧЕСКИЙ ХУК: три попытки найти правильный
+            // высокоуровневый метод (setBackgroundColor, BlurredBackground-
+            // ColorProviderThemed.getBackgroundColor) НЕ подтвердились --
+            // хуки ставятся, но реально ни разу не вызываются для видимого
+            // баннера. Вместо дальнейшего угадывания перехватываем сам
+            // ПРИМИТИВ отрисовки -- Paint.setColor(int) -- глобально в
+            // процессе, с логом стека вызова. Кто бы ни красил этот пиксель
+            // (glass, blur, RenderNode, обычный View), он обязан в итоге
+            // вызвать это. Фильтруем по "светлый и непрозрачный" цвет, чтобы
+            // не залить лог, и ограничиваем число сработок.
+            // ============================================================
+            try {
+                XposedHelpers.findAndHookMethod(android.graphics.Paint.class, "setColor", int.class,
+                        new XC_MethodHook() {
+                            @Override
+                            protected void beforeHookedMethod(MethodHookParam param) {
+                                if (paintDiagCount.get() >= 40) {
+                                    return;
+                                }
+                                int color = (Integer) param.args[0];
+                                int a = Color.alpha(color);
+                                int r = Color.red(color);
+                                int g = Color.green(color);
+                                int b = Color.blue(color);
+                                // светлый (близко к белому/серому) и непрозрачный
+                                boolean light = a > 200 && r > 180 && g > 180 && b > 180;
+                                if (!light) {
+                                    return;
+                                }
+                                paintDiagCount.incrementAndGet();
+                                StringBuilder sb = new StringBuilder();
+                                sb.append("[TransparentTelegram][PAINTDIAG] setColor(#")
+                                        .append(Integer.toHexString(color)).append(") stack:");
+                                StackTraceElement[] st = new Throwable().getStackTrace();
+                                for (int i = 0; i < Math.min(8, st.length); i++) {
+                                    sb.append("\n    at ").append(st[i].toString());
+                                }
+                                XposedBridge.log(sb.toString());
+                            }
+                        });
+                XposedBridge.log("[TransparentTelegram] Paint.setColor diag hook installed for " + packageName);
+            } catch (Throwable t) {
+                XposedBridge.log("[TransparentTelegram] Paint.setColor diag hook failed for " + packageName + ": " + t);
             }
 
             XposedHelpers.findAndHookMethod(launchActivityClass, "onCreate", Bundle.class,
