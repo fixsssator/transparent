@@ -137,14 +137,21 @@ gradle assembleDebug
 
 ## "Glass"-редизайн (Telegram 12.10.x+)
 
-Начиная с этой версии часть заголовков (`ActionBar`) красится НЕ через
-`setBackgroundColor()`, а через новый механизм: `ActionBar.setupGlass(...)`
-/`setDrawBlurBackground(...)`, которые берут цвет из отдельного
-объекта-интерфейса `BlurredBackgroundColorProvider` (метод
-`getBackgroundColor()`), опрашиваемого при каждой перерисовке блюра.
-Хук на `setBackgroundColor` это не видит вообще. Ловим конкретную
-реализацию — `BlurredBackgroundColorProviderThemed.getBackgroundColor()`
-— и режем альфу возвращаемого цвета (интерфейсы напрямую хукать нельзя,
-только конкретные реализующие классы). Если в будущей версии появится
-ещё одна реализация интерфейса — её тоже нужно будет добавить отдельным
-хуком по тому же принципу.
+Настоящий источник цвета найден методом диагностики: временный хук на
+`Paint.setColor()` со стеком вызова (искать в проекте не нужно, уже
+убран из финальной логики) показал, что реальная заливка фона для
+blur3-компонентов (шапка, вкладки, поиск) идёт через
+`org.telegram.ui.Components.blur3.source.BlurredBackgroundSourceColor`:
+
+```
+setColor(int)   -- сохраняет цвет в приватный Paint
+draw(Canvas,l,t,r,b) -- canvas.drawRect(l,t,r,b,paint) -- реальная заливка
+```
+
+Это универсальный "источник цвета", используемый ЛЮБЫМ компонентом,
+реализующим интерфейс `BlurredBackgroundSource` -- поэтому хук на
+`BlurredBackgroundSourceColor.setColor(int)` должен закрыть разом шапку,
+вкладки и другие blur3-элементы. Более ранние попытки
+(`ActionBar.setBackgroundColor`, `BlurredBackgroundColorProviderThemed`)
+технически устанавливались, но подтверждённо НИ РАЗУ не вызывались для
+видимой шапки -- поэтому не давали эффекта, хотя формально "работали".

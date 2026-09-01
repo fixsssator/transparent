@@ -148,6 +148,38 @@ public class HookEntry implements IXposedHookLoadPackage {
                 XposedBridge.log("[TransparentTelegram] BlurredBackgroundColorProviderThemed hook failed for " + packageName + ": " + t);
             }
 
+            // НАСТОЯЩИЙ универсальный источник цвета для blur3-рендеринга,
+            // найден через диагностику Paint.setColor + анализ стека вызова:
+            // BlurredBackgroundSourceColor.setColor(int) сохраняет цвет в
+            // приватный Paint, а draw(Canvas,l,t,r,b) заливает им прямоугольник
+            // через canvas.drawRect(...) -- это и есть реальная заливка фона
+            // для ЛЮБОГО blur3-компонента (шапка, вкладки, поиск и т.д.),
+            // реализующего интерфейс BlurredBackgroundSource. В отличие от
+            // ActionBar.setBackgroundColor и BlurredBackgroundColorProviderThemed
+            // (оба ставились, но ни разу не вызывались для видимой шапки) --
+            // этот метод подтверждённо вызывается (10 раз в диагностике).
+            try {
+                Class<?> sourceColorClass = XposedHelpers.findClass(
+                        "org.telegram.ui.Components.blur3.source.BlurredBackgroundSourceColor",
+                        lpparam.classLoader);
+                XposedHelpers.findAndHookMethod(sourceColorClass, "setColor", int.class,
+                        new XC_MethodHook() {
+                            @Override
+                            protected void beforeHookedMethod(MethodHookParam param) {
+                                int original = (Integer) param.args[0];
+                                if (Color.alpha(original) == 255) {
+                                    int patched = (original & 0x00FFFFFF) | (ALPHA << 24);
+                                    param.args[0] = patched;
+                                    XposedBridge.log("[TransparentTelegram] BlurredBackgroundSourceColor.setColor: "
+                                            + Integer.toHexString(original) + " -> " + Integer.toHexString(patched));
+                                }
+                            }
+                        });
+                XposedBridge.log("[TransparentTelegram] BlurredBackgroundSourceColor hook installed for " + packageName);
+            } catch (Throwable t) {
+                XposedBridge.log("[TransparentTelegram] BlurredBackgroundSourceColor hook failed for " + packageName + ": " + t);
+            }
+
             // ============================================================
             // ВРЕМЕННЫЙ ДИАГНОСТИЧЕСКИЙ ХУК: три попытки найти правильный
             // высокоуровневый метод (setBackgroundColor, BlurredBackground-
