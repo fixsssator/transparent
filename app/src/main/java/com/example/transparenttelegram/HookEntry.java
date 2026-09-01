@@ -64,6 +64,10 @@ public class HookEntry implements IXposedHookLoadPackage {
     // чтобы не залить лог (setColor может вызываться тысячи раз за кадр).
     private static final AtomicInteger paintDiagCount = new AtomicInteger(0);
 
+    // Аналогично ограничиваем ЛОГИРОВАНИЕ (не саму правку) для draw()-хука,
+    // который может вызываться на каждый кадр.
+    private static final AtomicInteger drawFixLogCount = new AtomicInteger(0);
+
     private static final int ALPHA = 0x80;
     private static final int WINDOW_BACKGROUND_COLOR = Color.argb(ALPHA, 0, 0, 0);
     // Блюр-плашки (BlurredBackgroundWithFadeDrawable и т.п.) под статус-баром/
@@ -185,6 +189,43 @@ public class HookEntry implements IXposedHookLoadPackage {
                 XposedBridge.log("[TransparentTelegram] BlurredBackgroundSourceColor hook installed for " + packageName);
             } catch (Throwable t) {
                 XposedBridge.log("[TransparentTelegram] BlurredBackgroundSourceColor hook failed for " + packageName + ": " + t);
+            }
+
+            // ДОПОЛНИТЕЛЬНО (на случай, если setColor() кэшируется в GPU
+            // RenderNode и не обновляет уже записанный список команд отрисовки):
+            // перехватываем сам draw(Canvas,l,t,r,b) -- он вызывает
+            // canvas.drawRect(l,t,r,b,paint) при КАЖДОМ кадре, так что правка
+            // цвета внутреннего Paint прямо перед этим вызовом гарантированно
+            // попадает в то, что реально рисуется, а не в промежуточное
+            // состояние объекта.
+            try {
+                Class<?> sourceColorClass2 = XposedHelpers.findClass(
+                        "org.telegram.ui.Components.blur3.source.BlurredBackgroundSourceColor",
+                        lpparam.classLoader);
+                XposedHelpers.findAndHookMethod(sourceColorClass2, "draw",
+                        android.graphics.Canvas.class, float.class, float.class, float.class, float.class,
+                        new XC_MethodHook() {
+                            @Override
+                            protected void beforeHookedMethod(MethodHookParam param) {
+                                try {
+                                    Object paintObj = XposedHelpers.getObjectField(param.thisObject, "paint");
+                                    android.graphics.Paint paint = (android.graphics.Paint) paintObj;
+                                    int current = paint.getColor();
+                                    if (Color.alpha(current) == 255) {
+                                        paint.setColor(WINDOW_BACKGROUND_COLOR);
+                                        if (drawFixLogCount.incrementAndGet() <= 20) {
+                                            XposedBridge.log("[TransparentTelegram] BlurredBackgroundSourceColor.draw: forced paint color "
+                                                    + Integer.toHexString(current) + " -> " + Integer.toHexString(WINDOW_BACKGROUND_COLOR));
+                                        }
+                                    }
+                                } catch (Throwable t) {
+                                    XposedBridge.log("[TransparentTelegram] draw() paint patch failed: " + t);
+                                }
+                            }
+                        });
+                XposedBridge.log("[TransparentTelegram] BlurredBackgroundSourceColor.draw hook installed for " + packageName);
+            } catch (Throwable t) {
+                XposedBridge.log("[TransparentTelegram] BlurredBackgroundSourceColor.draw hook failed for " + packageName + ": " + t);
             }
 
             // ============================================================
