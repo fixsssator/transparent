@@ -168,10 +168,17 @@ public class HookEntry implements IXposedHookLoadPackage {
                             protected void beforeHookedMethod(MethodHookParam param) {
                                 int original = (Integer) param.args[0];
                                 if (Color.alpha(original) == 255) {
-                                    int patched = (original & 0x00FFFFFF) | (ALPHA << 24);
-                                    param.args[0] = patched;
+                                    // ВАЖНО: не просто снижаем альфу исходному цвету --
+                                    // если исходный цвет светлый/белый (как здесь,
+                                    // #ffffffff), то даже 50%-альфа белого поверх
+                                    // обоины всё равно даёт светлый/белёсый результат
+                                    // (это математика смешивания цветов, не баг хука).
+                                    // ПОЛНОСТЬЮ ЗАМЕНЯЕМ на тот же фиксированный тёмный
+                                    // тон, что и везде остальное (WINDOW_BACKGROUND_COLOR) --
+                                    // тот же приём, что уже работает для обычных "стен".
+                                    param.args[0] = WINDOW_BACKGROUND_COLOR;
                                     XposedBridge.log("[TransparentTelegram] BlurredBackgroundSourceColor.setColor: "
-                                            + Integer.toHexString(original) + " -> " + Integer.toHexString(patched));
+                                            + Integer.toHexString(original) + " -> " + Integer.toHexString(WINDOW_BACKGROUND_COLOR));
                                 }
                             }
                         });
