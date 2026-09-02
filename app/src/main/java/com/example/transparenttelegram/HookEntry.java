@@ -71,6 +71,9 @@ public class HookEntry implements IXposedHookLoadPackage {
     // Аналогично для логов сброса кэша display-list у RenderNode.
     private static final AtomicInteger renderNodeFixLogCount = new AtomicInteger(0);
 
+    // Аналогично для универсального хука Canvas.drawRect.
+    private static final AtomicInteger canvasFixLogCount = new AtomicInteger(0);
+
     private static final int ALPHA = 0x80;
     private static final int WINDOW_BACKGROUND_COLOR = Color.argb(ALPHA, 0, 0, 0);
 
@@ -290,6 +293,71 @@ public class HookEntry implements IXposedHookLoadPackage {
                 XposedBridge.log("[TransparentTelegram] BlurredBackgroundDrawableRenderNode hook installed for " + packageName);
             } catch (Throwable t) {
                 XposedBridge.log("[TransparentTelegram] BlurredBackgroundDrawableRenderNode hook failed for " + packageName + ": " + t);
+            }
+
+            // Найдено сопоставлением скриншота с координатами из [DIAG]-дампа:
+            // белая область сверху (шапка + "затухание" под лентой историй)
+            // рисуется НЕ через blur3/glass систему вообще, а отдельным
+            // классом DialogsActivityTopBubblesFadeView, который строит
+            // LinearGradient(color -> transparent) и красит им фон через
+            // Paint.setShader() -- поэтому НИ ОДИН из хуков на setColor()
+            // (которые проверяют итоговый Paint.getColor()) не мог это
+            // поймать: цвет тут используется только как ВХОДНОЕ значение
+            // для построения градиента, а не как прямой цвет заливки.
+            try {
+                Class<?> fadeViewClass = XposedHelpers.findClass(
+                        "org.telegram.ui.Components.DialogsActivityTopBubblesFadeView",
+                        lpparam.classLoader);
+                XposedHelpers.findAndHookMethod(fadeViewClass, "setColor", int.class,
+                        new XC_MethodHook() {
+                            @Override
+                            protected void beforeHookedMethod(MethodHookParam param) {
+                                int original = (Integer) param.args[0];
+                                if (Color.alpha(original) == 255) {
+                                    int patched = debugColor(WINDOW_BACKGROUND_COLOR);
+                                    param.args[0] = patched;
+                                    XposedBridge.log("[TransparentTelegram] DialogsActivityTopBubblesFadeView.setColor: "
+                                            + Integer.toHexString(original) + " -> " + Integer.toHexString(patched));
+                                }
+                            }
+                        });
+                XposedBridge.log("[TransparentTelegram] DialogsActivityTopBubblesFadeView hook installed for " + packageName);
+            } catch (Throwable t) {
+                XposedBridge.log("[TransparentTelegram] DialogsActivityTopBubblesFadeView hook failed for " + packageName + ": " + t);
+            }
+
+            // ============================================================
+            // САМЫЙ УНИВЕРСАЛЬНЫЙ ФИКС: перехватываем сам Canvas.drawRect()
+            // с Paint -- это финальная точка перед тем, как пиксели реально
+            // попадают на экран, независимо от того, какой класс/абстракция
+            // до этого крутила цвета (setColor, shader, RenderNode и т.д.).
+            // Если Paint в момент вызова светлый и непрозрачный -- меняем
+            // его цвет ПРЯМО ПЕРЕД отрисовкой. Это должно поймать вообще
+            // любой механизм закраски, включая те, что мы ещё не нашли.
+            // ============================================================
+            try {
+                XposedHelpers.findAndHookMethod(android.graphics.Canvas.class, "drawRect",
+                        float.class, float.class, float.class, float.class, android.graphics.Paint.class,
+                        new XC_MethodHook() {
+                            @Override
+                            protected void beforeHookedMethod(MethodHookParam param) {
+                                android.graphics.Paint paint = (android.graphics.Paint) param.args[4];
+                                int color = paint.getColor();
+                                if (Color.alpha(color) > 200 && Color.red(color) > 180
+                                        && Color.green(color) > 180 && Color.blue(color) > 180
+                                        && paint.getShader() == null) {
+                                    paint.setColor(debugColor(WINDOW_BACKGROUND_COLOR));
+                                    if (canvasFixLogCount.incrementAndGet() <= 30) {
+                                        XposedBridge.log("[TransparentTelegram] Canvas.drawRect: forced light paint "
+                                                + Integer.toHexString(color) + " -> " + Integer.toHexString(debugColor(WINDOW_BACKGROUND_COLOR))
+                                                + " rect=(" + param.args[0] + "," + param.args[1] + "," + param.args[2] + "," + param.args[3] + ")");
+                                    }
+                                }
+                            }
+                        });
+                XposedBridge.log("[TransparentTelegram] Canvas.drawRect universal hook installed for " + packageName);
+            } catch (Throwable t) {
+                XposedBridge.log("[TransparentTelegram] Canvas.drawRect universal hook failed for " + packageName + ": " + t);
             }
 
             // ============================================================
