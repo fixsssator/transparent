@@ -73,6 +73,21 @@ public class HookEntry implements IXposedHookLoadPackage {
 
     private static final int ALPHA = 0x80;
     private static final int WINDOW_BACKGROUND_COLOR = Color.argb(ALPHA, 0, 0, 0);
+
+    // ================================================================
+    // ВРЕМЕННЫЙ ДИАГНОСТИЧЕСКИЙ ФЛАГ: если true, ВСЕ хуки, что заменяют
+    // цвет на WINDOW_BACKGROUND_COLOR, вместо этого красят в кричащий
+    // непрозрачный малиновый -- чтобы визуально увидеть, что из
+    // подтверждённо срабатывающих хуков реально влияет на экран, а что
+    // патчит невидимый/неактивный элемент. Верните false перед финальной
+    // сборкой.
+    // ================================================================
+    private static final boolean FLAG_COLOR_DEBUG = true;
+    private static final int FLAG_COLOR = Color.argb(255, 255, 0, 220); // кричащий малиновый, alpha=255
+
+    private static int debugColor(int normalColor) {
+        return FLAG_COLOR_DEBUG ? FLAG_COLOR : normalColor;
+    }
     // Блюр-плашки (BlurredBackgroundWithFadeDrawable и т.п.) под статус-баром/
     // шапкой блюрят реальную обоину + свой fade-тон -- смотрится "пересвеченно",
     // если оставить как есть. Приглушаем сильнее, чем обычную стену.
@@ -183,9 +198,9 @@ public class HookEntry implements IXposedHookLoadPackage {
                                     // ПОЛНОСТЬЮ ЗАМЕНЯЕМ на тот же фиксированный тёмный
                                     // тон, что и везде остальное (WINDOW_BACKGROUND_COLOR) --
                                     // тот же приём, что уже работает для обычных "стен".
-                                    param.args[0] = WINDOW_BACKGROUND_COLOR;
+                                    param.args[0] = debugColor(WINDOW_BACKGROUND_COLOR);
                                     XposedBridge.log("[TransparentTelegram] BlurredBackgroundSourceColor.setColor: "
-                                            + Integer.toHexString(original) + " -> " + Integer.toHexString(WINDOW_BACKGROUND_COLOR));
+                                            + Integer.toHexString(original) + " -> " + Integer.toHexString(debugColor(WINDOW_BACKGROUND_COLOR)));
                                 }
                             }
                         });
@@ -215,10 +230,10 @@ public class HookEntry implements IXposedHookLoadPackage {
                                     android.graphics.Paint paint = (android.graphics.Paint) paintObj;
                                     int current = paint.getColor();
                                     if (Color.alpha(current) == 255) {
-                                        paint.setColor(WINDOW_BACKGROUND_COLOR);
+                                        paint.setColor(debugColor(WINDOW_BACKGROUND_COLOR));
                                         if (drawFixLogCount.incrementAndGet() <= 20) {
                                             XposedBridge.log("[TransparentTelegram] BlurredBackgroundSourceColor.draw: forced paint color "
-                                                    + Integer.toHexString(current) + " -> " + Integer.toHexString(WINDOW_BACKGROUND_COLOR));
+                                                    + Integer.toHexString(current) + " -> " + Integer.toHexString(debugColor(WINDOW_BACKGROUND_COLOR)));
                                         }
                                     }
                                 } catch (Throwable t) {
@@ -511,7 +526,7 @@ public class HookEntry implements IXposedHookLoadPackage {
             // Цена: пропадает сам эффект блюра позади шапки/поиска, остаётся
             // ровный полупрозрачный тон -- визуально это лучше, чем "пересвет".
             try {
-                view.setBackgroundColor(WINDOW_BACKGROUND_COLOR);
+                view.setBackgroundColor(debugColor(WINDOW_BACKGROUND_COLOR));
                 XposedBridge.log("[TransparentTelegram] Блюр заменён на плоский тон: "
                         + view.getClass().getName() + " (было " + bg.getClass().getName()
                         + ", " + view.getWidth() + "x" + view.getHeight() + ")");
@@ -533,7 +548,7 @@ public class HookEntry implements IXposedHookLoadPackage {
                         // чатов в светлой теме и т.п.) -- получается "пересвеченное"
                         // мутно-белое стекло поверх обоины, а не аккуратный
                         // тёмный тон, как в чате.
-                        view.setBackgroundColor(WINDOW_BACKGROUND_COLOR);
+                        view.setBackgroundColor(debugColor(WINDOW_BACKGROUND_COLOR));
                     } else {
                         // Для НЕ-сплошного фона (обои чата, паттерны, битмапы) --
                         // заменить целиком нельзя, там важна сама картинка, поэтому
