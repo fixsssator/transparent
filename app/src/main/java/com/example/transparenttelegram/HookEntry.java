@@ -68,6 +68,9 @@ public class HookEntry implements IXposedHookLoadPackage {
     // который может вызываться на каждый кадр.
     private static final AtomicInteger drawFixLogCount = new AtomicInteger(0);
 
+    // Аналогично для логов сброса кэша display-list у RenderNode.
+    private static final AtomicInteger renderNodeFixLogCount = new AtomicInteger(0);
+
     private static final int ALPHA = 0x80;
     private static final int WINDOW_BACKGROUND_COLOR = Color.argb(ALPHA, 0, 0, 0);
     // Блюр-плашки (BlurredBackgroundWithFadeDrawable и т.п.) под статус-баром/
@@ -226,6 +229,38 @@ public class HookEntry implements IXposedHookLoadPackage {
                 XposedBridge.log("[TransparentTelegram] BlurredBackgroundSourceColor.draw hook installed for " + packageName);
             } catch (Throwable t) {
                 XposedBridge.log("[TransparentTelegram] BlurredBackgroundSourceColor.draw hook failed for " + packageName + ": " + t);
+            }
+
+            // ГЛАВНЫЙ ФИКС: BlurredBackgroundDrawableRenderNode кэширует
+            // GPU display-list (updateDisplayList()/hasDisplayList()) и просто
+            // ПЕРЕИГРЫВАЕТ уже записанную картинку при каждой отрисовке --
+            // не перечитывая исходный цвет заново. Наш патч цвета в
+            // BlurredBackgroundSourceColor происходит ПОСЛЕ этой записи,
+            // поэтому визуально ничего не менялось, хотя код формально
+            // отрабатывал. Принудительно сбрасываем кэш (invalidateDisplayList())
+            // перед каждой отрисовкой -- тогда display-list перезапишется
+            // заново, уже с патченным цветом.
+            try {
+                Class<?> renderNodeClass = XposedHelpers.findClass(
+                        "org.telegram.ui.Components.blur3.drawable.BlurredBackgroundDrawableRenderNode",
+                        lpparam.classLoader);
+                XposedHelpers.findAndHookMethod(renderNodeClass, "draw", android.graphics.Canvas.class,
+                        new XC_MethodHook() {
+                            @Override
+                            protected void beforeHookedMethod(MethodHookParam param) {
+                                try {
+                                    XposedHelpers.callMethod(param.thisObject, "invalidateDisplayList");
+                                    if (renderNodeFixLogCount.incrementAndGet() <= 20) {
+                                        XposedBridge.log("[TransparentTelegram] BlurredBackgroundDrawableRenderNode: display list invalidated");
+                                    }
+                                } catch (Throwable t) {
+                                    XposedBridge.log("[TransparentTelegram] invalidateDisplayList failed: " + t);
+                                }
+                            }
+                        });
+                XposedBridge.log("[TransparentTelegram] BlurredBackgroundDrawableRenderNode hook installed for " + packageName);
+            } catch (Throwable t) {
+                XposedBridge.log("[TransparentTelegram] BlurredBackgroundDrawableRenderNode hook failed for " + packageName + ": " + t);
             }
 
             // ============================================================
