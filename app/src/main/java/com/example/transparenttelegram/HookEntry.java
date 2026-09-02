@@ -74,6 +74,10 @@ public class HookEntry implements IXposedHookLoadPackage {
     // Аналогично для универсального хука Canvas.drawRect.
     private static final AtomicInteger canvasFixLogCount = new AtomicInteger(0);
 
+    // Аналогично для drawRoundRect и drawPath.
+    private static final AtomicInteger roundRectFixLogCount = new AtomicInteger(0);
+    private static final AtomicInteger pathFixLogCount = new AtomicInteger(0);
+
     private static final int ALPHA = 0x80;
     private static final int WINDOW_BACKGROUND_COLOR = Color.argb(ALPHA, 0, 0, 0);
 
@@ -358,6 +362,146 @@ public class HookEntry implements IXposedHookLoadPackage {
                 XposedBridge.log("[TransparentTelegram] Canvas.drawRect universal hook installed for " + packageName);
             } catch (Throwable t) {
                 XposedBridge.log("[TransparentTelegram] Canvas.drawRect universal hook failed for " + packageName + ": " + t);
+            }
+
+            // Скруглённые карточки (Настройки: Accounts, список настроек,
+            // Premium) обычно рисуются через drawRoundRect(), а не drawRect() --
+            // отдельный метод Canvas, который наш предыдущий хук не ловил.
+            try {
+                XC_MethodHook roundRectHook = new XC_MethodHook() {
+                    @Override
+                    protected void beforeHookedMethod(MethodHookParam param) {
+                        // Paint -- последний аргумент в обоих перегрузках ниже.
+                        Object lastArg = param.args[param.args.length - 1];
+                        if (!(lastArg instanceof android.graphics.Paint)) {
+                            return;
+                        }
+                        android.graphics.Paint paint = (android.graphics.Paint) lastArg;
+                        int color = paint.getColor();
+                        if (Color.alpha(color) > 200 && Color.red(color) > 180
+                                && Color.green(color) > 180 && Color.blue(color) > 180
+                                && paint.getShader() == null) {
+                            paint.setColor(debugColor(WINDOW_BACKGROUND_COLOR));
+                            if (roundRectFixLogCount.incrementAndGet() <= 30) {
+                                XposedBridge.log("[TransparentTelegram] Canvas.drawRoundRect: forced light paint "
+                                        + Integer.toHexString(color) + " -> " + Integer.toHexString(debugColor(WINDOW_BACKGROUND_COLOR)));
+                            }
+                        }
+                    }
+                };
+                // перегрузка (left, top, right, bottom, rx, ry, Paint)
+                XposedHelpers.findAndHookMethod(android.graphics.Canvas.class, "drawRoundRect",
+                        float.class, float.class, float.class, float.class, float.class, float.class,
+                        android.graphics.Paint.class, roundRectHook);
+                // перегрузка (RectF, rx, ry, Paint)
+                XposedHelpers.findAndHookMethod(android.graphics.Canvas.class, "drawRoundRect",
+                        android.graphics.RectF.class, float.class, float.class,
+                        android.graphics.Paint.class, roundRectHook);
+                XposedBridge.log("[TransparentTelegram] Canvas.drawRoundRect universal hook installed for " + packageName);
+            } catch (Throwable t) {
+                XposedBridge.log("[TransparentTelegram] Canvas.drawRoundRect universal hook failed for " + packageName + ": " + t);
+            }
+
+            // Ещё один способ рисовать скруглённые карточки -- через
+            // Path (canvas.drawPath(path, paint)), особенно если у карточки
+            // разные радиусы на разных углах.
+            try {
+                XposedHelpers.findAndHookMethod(android.graphics.Canvas.class, "drawPath",
+                        android.graphics.Path.class, android.graphics.Paint.class,
+                        new XC_MethodHook() {
+                            @Override
+                            protected void beforeHookedMethod(MethodHookParam param) {
+                                android.graphics.Paint paint = (android.graphics.Paint) param.args[1];
+                                int color = paint.getColor();
+                                if (Color.alpha(color) > 200 && Color.red(color) > 180
+                                        && Color.green(color) > 180 && Color.blue(color) > 180
+                                        && paint.getShader() == null
+                                        && paint.getStyle() != android.graphics.Paint.Style.STROKE) {
+                                    paint.setColor(debugColor(WINDOW_BACKGROUND_COLOR));
+                                    if (pathFixLogCount.incrementAndGet() <= 30) {
+                                        XposedBridge.log("[TransparentTelegram] Canvas.drawPath: forced light paint "
+                                                + Integer.toHexString(color) + " -> " + Integer.toHexString(debugColor(WINDOW_BACKGROUND_COLOR)));
+                                    }
+                                }
+                            }
+                        });
+                XposedBridge.log("[TransparentTelegram] Canvas.drawPath universal hook installed for " + packageName);
+            } catch (Throwable t) {
+                XposedBridge.log("[TransparentTelegram] Canvas.drawPath universal hook failed for " + packageName + ": " + t);
+            }
+
+            // drawRect ни разу не сработал ДАЖЕ для уже подтверждённо рабочих
+            // (малиновых) элементов -- значит ColorDrawable.draw() красит через
+            // Canvas.drawColor(int), а не drawRect(). Хукаем и его тоже, плюс
+            // drawPaint (заливка всей области клипа) на всякий случай.
+            try {
+                XposedHelpers.findAndHookMethod(android.graphics.Canvas.class, "drawColor", int.class,
+                        new XC_MethodHook() {
+                            @Override
+                            protected void beforeHookedMethod(MethodHookParam param) {
+                                int color = (Integer) param.args[0];
+                                if (Color.alpha(color) > 200 && Color.red(color) > 180
+                                        && Color.green(color) > 180 && Color.blue(color) > 180) {
+                                    param.args[0] = debugColor(WINDOW_BACKGROUND_COLOR);
+                                    if (canvasFixLogCount.incrementAndGet() <= 30) {
+                                        XposedBridge.log("[TransparentTelegram] Canvas.drawColor: forced light color "
+                                                + Integer.toHexString(color) + " -> " + Integer.toHexString(debugColor(WINDOW_BACKGROUND_COLOR)));
+                                    }
+                                }
+                            }
+                        });
+                XposedBridge.log("[TransparentTelegram] Canvas.drawColor universal hook installed for " + packageName);
+            } catch (Throwable t) {
+                XposedBridge.log("[TransparentTelegram] Canvas.drawColor universal hook failed for " + packageName + ": " + t);
+            }
+
+            try {
+                XposedHelpers.findAndHookMethod(android.graphics.Canvas.class, "drawPaint", android.graphics.Paint.class,
+                        new XC_MethodHook() {
+                            @Override
+                            protected void beforeHookedMethod(MethodHookParam param) {
+                                android.graphics.Paint paint = (android.graphics.Paint) param.args[0];
+                                int color = paint.getColor();
+                                if (Color.alpha(color) > 200 && Color.red(color) > 180
+                                        && Color.green(color) > 180 && Color.blue(color) > 180
+                                        && paint.getShader() == null) {
+                                    paint.setColor(debugColor(WINDOW_BACKGROUND_COLOR));
+                                    if (canvasFixLogCount.incrementAndGet() <= 30) {
+                                        XposedBridge.log("[TransparentTelegram] Canvas.drawPaint: forced light paint "
+                                                + Integer.toHexString(color) + " -> " + Integer.toHexString(debugColor(WINDOW_BACKGROUND_COLOR)));
+                                    }
+                                }
+                            }
+                        });
+                XposedBridge.log("[TransparentTelegram] Canvas.drawPaint universal hook installed for " + packageName);
+            } catch (Throwable t) {
+                XposedBridge.log("[TransparentTelegram] Canvas.drawPaint universal hook failed for " + packageName + ": " + t);
+            }
+
+            // Ещё две перегрузки drawRect (RectF и Rect вместо 4 float) --
+            // на случай если где-то используется именно они.
+            try {
+                XposedHelpers.findAndHookMethod(android.graphics.Canvas.class, "drawRect",
+                        android.graphics.RectF.class, android.graphics.Paint.class,
+                        new XC_MethodHook() {
+                            @Override
+                            protected void beforeHookedMethod(MethodHookParam param) {
+                                android.graphics.Paint paint = (android.graphics.Paint) param.args[1];
+                                int color = paint.getColor();
+                                if (Color.alpha(color) > 200 && Color.red(color) > 180
+                                        && Color.green(color) > 180 && Color.blue(color) > 180
+                                        && paint.getShader() == null) {
+                                    paint.setColor(debugColor(WINDOW_BACKGROUND_COLOR));
+                                    if (canvasFixLogCount.incrementAndGet() <= 30) {
+                                        XposedBridge.log("[TransparentTelegram] Canvas.drawRect(RectF): forced light paint "
+                                                + Integer.toHexString(color) + " -> " + Integer.toHexString(debugColor(WINDOW_BACKGROUND_COLOR)));
+                                    }
+                                }
+                            }
+                        });
+                XposedBridge.log("[TransparentTelegram] Canvas.drawRect(RectF) universal hook installed for " + packageName);
+            } catch (Throwable t) {
+                XposedBridge.log("[TransparentTelegram] Canvas.drawRect(RectF) universal hook failed for " + packageName + ": " + t);
             }
 
             // ============================================================
