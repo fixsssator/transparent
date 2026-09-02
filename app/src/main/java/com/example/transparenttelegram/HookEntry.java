@@ -152,19 +152,33 @@ public class HookEntry implements IXposedHookLoadPackage {
                 Class<?> providerClass = XposedHelpers.findClass(
                         "org.telegram.ui.Components.blur3.drawable.color.BlurredBackgroundColorProviderThemed",
                         lpparam.classLoader);
-                XposedHelpers.findAndHookMethod(providerClass, "getBackgroundColor",
-                        new XC_MethodHook() {
-                            @Override
-                            protected void afterHookedMethod(MethodHookParam param) {
-                                int original = (Integer) param.getResult();
-                                if (Color.alpha(original) == 255) {
-                                    int patched = (original & 0x00FFFFFF) | (ALPHA << 24);
-                                    param.setResult(patched);
-                                    XposedBridge.log("[TransparentTelegram] BlurredBackgroundColorProviderThemed.getBackgroundColor: "
-                                            + Integer.toHexString(original) + " -> " + Integer.toHexString(patched));
-                                }
-                            }
-                        });
+                // Хукаем ВСЕ 4 метода интерфейса, не только getBackgroundColor()
+                // (который, как выяснилось, для видимой шапки ни разу не вызывается).
+                // Гипотеза: видимая "белая" область -- это не заливка фона, а
+                // отдельный светлый STROKE/блик поверх (типичный приём в
+                // "стеклянном" UI - имитация блика на кромке стекла), рисуемый
+                // ДРУГИМ методом этого же провайдера, поверх уже правильно
+                // патченной заливки -- отсюда ощущение "нахлёста двух прозрачностей".
+                for (String methodName : new String[]{
+                        "getBackgroundColor", "getShadowColor", "getStrokeColorTop", "getStrokeColorBottom"}) {
+                    try {
+                        XposedHelpers.findAndHookMethod(providerClass, methodName,
+                                new XC_MethodHook() {
+                                    @Override
+                                    protected void afterHookedMethod(MethodHookParam param) {
+                                        int original = (Integer) param.getResult();
+                                        if (Color.alpha(original) == 255) {
+                                            int patched = debugColor(WINDOW_BACKGROUND_COLOR);
+                                            param.setResult(patched);
+                                            XposedBridge.log("[TransparentTelegram] BlurredBackgroundColorProviderThemed." + methodName + ": "
+                                                    + Integer.toHexString(original) + " -> " + Integer.toHexString(patched));
+                                        }
+                                    }
+                                });
+                    } catch (Throwable t) {
+                        XposedBridge.log("[TransparentTelegram] hook for " + methodName + " failed: " + t);
+                    }
+                }
                 XposedBridge.log("[TransparentTelegram] BlurredBackgroundColorProviderThemed hook installed for " + packageName);
             } catch (Throwable t) {
                 XposedBridge.log("[TransparentTelegram] BlurredBackgroundColorProviderThemed hook failed for " + packageName + ": " + t);
