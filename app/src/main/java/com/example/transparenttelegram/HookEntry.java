@@ -78,6 +78,9 @@ public class HookEntry implements IXposedHookLoadPackage {
     private static final AtomicInteger roundRectFixLogCount = new AtomicInteger(0);
     private static final AtomicInteger pathFixLogCount = new AtomicInteger(0);
 
+    // Диагностика drawBitmap -- не фикс, только счётчик логов.
+    private static final AtomicInteger bitmapDiagCount = new AtomicInteger(0);
+
     private static final int ALPHA = 0x80;
     private static final int WINDOW_BACKGROUND_COLOR = Color.argb(ALPHA, 0, 0, 0);
 
@@ -428,6 +431,58 @@ public class HookEntry implements IXposedHookLoadPackage {
                 XposedBridge.log("[TransparentTelegram] Canvas.drawPath universal hook installed for " + packageName);
             } catch (Throwable t) {
                 XposedBridge.log("[TransparentTelegram] Canvas.drawPath universal hook failed for " + packageName + ": " + t);
+            }
+
+            // ПОСЛЕДНИЙ вариант: если область рисуется через уже готовый,
+            // закэшированный Bitmap (blur посчитан один раз и просто
+            // переиспользуется как картинка) -- ни один из хуков на
+            // Paint/setColor/drawRect/drawPath до этого физически не мог
+            // достать, т.к. цвет уже "запечён" в пикселях самого Bitmap,
+            // а не выставляется через Paint при каждой отрисовке.
+            // Только ДИАГНОСТИКА (не фикс) -- сэмплируем центральный пиксель
+            // и логируем стек, если он светлый.
+            try {
+                XC_MethodHook bitmapDiagHook = new XC_MethodHook() {
+                    @Override
+                    protected void beforeHookedMethod(MethodHookParam param) {
+                        if (bitmapDiagCount.get() >= 25) {
+                            return;
+                        }
+                        try {
+                            android.graphics.Bitmap bmp = (android.graphics.Bitmap) param.args[0];
+                            if (bmp == null || bmp.getWidth() == 0 || bmp.getHeight() == 0) {
+                                return;
+                            }
+                            int cx = bmp.getWidth() / 2;
+                            int cy = bmp.getHeight() / 2;
+                            int pixel = bmp.getPixel(cx, cy);
+                            if (Color.alpha(pixel) > 200 && Color.red(pixel) > 180
+                                    && Color.green(pixel) > 180 && Color.blue(pixel) > 180) {
+                                bitmapDiagCount.incrementAndGet();
+                                StringBuilder sb = new StringBuilder();
+                                sb.append("[TransparentTelegram][BITMAPDIAG] drawBitmap center pixel #")
+                                        .append(Integer.toHexString(pixel))
+                                        .append(" size=").append(bmp.getWidth()).append("x").append(bmp.getHeight())
+                                        .append(" stack:");
+                                StackTraceElement[] st = new Throwable().getStackTrace();
+                                for (int i = 0; i < Math.min(8, st.length); i++) {
+                                    sb.append("\n    at ").append(st[i].toString());
+                                }
+                                XposedBridge.log(sb.toString());
+                            }
+                        } catch (Throwable ignored) {
+                        }
+                    }
+                };
+                XposedHelpers.findAndHookMethod(android.graphics.Canvas.class, "drawBitmap",
+                        android.graphics.Bitmap.class, float.class, float.class, android.graphics.Paint.class,
+                        bitmapDiagHook);
+                XposedHelpers.findAndHookMethod(android.graphics.Canvas.class, "drawBitmap",
+                        android.graphics.Bitmap.class, android.graphics.Rect.class, android.graphics.RectF.class,
+                        android.graphics.Paint.class, bitmapDiagHook);
+                XposedBridge.log("[TransparentTelegram] Canvas.drawBitmap diag hook installed for " + packageName);
+            } catch (Throwable t) {
+                XposedBridge.log("[TransparentTelegram] Canvas.drawBitmap diag hook failed for " + packageName + ": " + t);
             }
 
             // drawRect ни разу не сработал ДАЖЕ для уже подтверждённо рабочих
