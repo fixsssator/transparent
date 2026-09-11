@@ -24,6 +24,24 @@ import de.robv.android.xposed.XposedBridge;
 import de.robv.android.xposed.XposedHelpers;
 import de.robv.android.xposed.callbacks.XC_LoadPackage;
 
+/**
+ * Transparent Telegram — универсальный LSPosed-модуль.
+ *
+ * Ключевые находки:
+ * 1. Патч APK менял styles.xml (windowShowWallpaper + полупрозрачный
+ *    windowBackground), ThemeColors.createDefaultColors() и пару
+ *    методов в ThemeInfo/ChatActivity$ThemeDelegate.
+ * 2. Вместо createDefaultColors() хукаем Theme.getColor(I[ZZ)I --
+ *    универсальную точку запроса цвета по ключу, работает и для
+ *    дефолтной, и для пользовательской темы.
+ * 3. ВАЖНО: статические поля Theme.key_* НЕЛЬЗЯ читать в
+ *    handleLoadPackage -- это триггерит <clinit> класса Theme до
+ *    готовности Context и НАВСЕГДА ломает класс для всего процесса
+ *    (NoClassDefFoundError -> краш приложения). Читаем лениво при
+ *    первом вызове getColor().
+ * 4. Тёмный текст на прозрачном фоне не читается -- инвертируем
+ *    текстовые ключи на светлый цвет (только если исходный тёмный).
+ */
 public class HookEntry implements IXposedHookLoadPackage {
 
     private static final Set<String> TARGET_PACKAGES = new HashSet<>(Arrays.asList(
@@ -42,23 +60,62 @@ public class HookEntry implements IXposedHookLoadPackage {
     private static final int ALPHA = 0x80;
     private static final int WINDOW_BACKGROUND_COLOR = Color.argb(ALPHA, 0, 0, 0);
     private static final int BLUR_ALPHA = 0x40;
+    private static final int TEXT_COLOR_LIGHT = Color.argb(0xFF, 0xEE, 0xEE, 0xEE);
 
+    // "Фоновые" ключи -- подменяем на полупрозрачный чёрный.
     private static final String[] BACKGROUND_KEY_NAMES = {
             "key_windowBackgroundWhite",
             "key_windowBackgroundGray",
             "key_windowBackgroundUnchecked",
             "key_actionBarDefault",
             "key_actionBarDefaultArchived",
-            "key_windowBackgroundWhiteBlackText",
     };
 
-    // --- Ленивое разрешение ключей Theme.key_* ---
-    // ВАЖНО: нельзя читать эти статические поля в handleLoadPackage --
-    // это триггерит <clinit> класса Theme до готовности Context и
-    // НАВСЕГДА ломает класс для всего процесса (NoClassDefFoundError).
-    // Читаем при первом реальном вызове getColor(), когда Theme уже
-    // инициализирован самим Telegram.
+    // Текстовые ключи -- инвертируем тёмный текст на светлый.
+    // ВАЖНО: key_windowBackgroundWhiteBlackText НЕ должен быть в
+    // BACKGROUND_KEY_NAMES, иначе фон и текст дерутся за один ключ.
+    private static final String[] TEXT_KEY_NAMES = {
+            "key_windowBackgroundWhiteBlackText",
+            "key_windowBackgroundWhiteGrayText",
+            "key_windowBackgroundWhiteGrayText2",
+            "key_windowBackgroundWhiteGrayText3",
+            "key_windowBackgroundWhiteGrayText4",
+            "key_windowBackgroundWhiteGrayText5",
+            "key_windowBackgroundWhiteGrayText6",
+            "key_windowBackgroundWhiteGrayText7",
+            "key_windowBackgroundWhiteGrayText8",
+            "key_windowBackgroundWhiteHintText",
+            "key_windowBackgroundWhiteValueText",
+            "key_windowBackgroundWhiteLinkText",
+            "key_windowBackgroundWhiteBlueText",
+            "key_windowBackgroundWhiteBlueText2",
+            "key_windowBackgroundWhiteBlueText3",
+            "key_windowBackgroundWhiteBlueText4",
+            "key_windowBackgroundWhiteBlueText5",
+            "key_windowBackgroundWhiteBlueText6",
+            "key_windowBackgroundWhiteBlueText7",
+            "key_windowBackgroundWhiteBlueHeader",
+            "key_windowBackgroundWhiteInputField",
+            "key_windowBackgroundWhiteInputFieldActivated",
+            "key_text_RedRegular",
+            "key_text_RedBold",
+            "key_actionBarDefaultTitle",
+            "key_actionBarDefaultSubtitle",
+            "key_actionBarDefaultIcon",
+            "key_dialogTextBlack",
+            "key_dialogTextGray",
+            "key_dialogTextGray2",
+            "key_dialogTextGray3",
+            "key_dialogTextLink",
+            "key_dialogTextBlue",
+            "key_dialogTextBlue2",
+            "key_dialogTextHint",
+            "key_dialogTextRed",
+    };
+
+    // --- Ленивое разрешение ключей ---
     private static volatile Set<Integer> backgroundKeys = null;
+    private static volatile Set<Integer> textKeys = null;
     private static volatile Map<Integer, String> keyNamesByValue = null;
     private static final Object KEYS_LOCK = new Object();
     private static volatile boolean keysResolveFailed = false;
@@ -75,27 +132,50 @@ public class HookEntry implements IXposedHookLoadPackage {
             }
             try {
                 Class<?> themeClass = XposedHelpers.findClass(THEME_CLASS, cl);
-                Set<Integer> keys = new HashSet<>();
+                Set<Integer> bgKeys = new HashSet<>();
+                Set<Integer> txtKeys = new HashSet<>();
                 Map<Integer, String> names = new HashMap<>();
+
                 for (String keyName : BACKGROUND_KEY_NAMES) {
                     try {
                         int keyValue = XposedHelpers.getStaticIntField(themeClass, keyName);
-                        keys.add(keyValue);
+                        bgKeys.add(keyValue);
                         names.put(keyValue, keyName);
                     } catch (Throwable t) {
-                        XposedBridge.log("[TransparentTelegram] key " + keyName
-                                + " not found (ok, skipping): " + t);
+                        XposedBridge.log("[TransparentTelegram] bg key " + keyName
+                                + " not found (ok): " + t);
                     }
                 }
+                for (String keyName : TEXT_KEY_NAMES) {
+                    try {
+                        int keyValue = XposedHelpers.getStaticIntField(themeClass, keyName);
+                        txtKeys.add(keyValue);
+                        names.put(keyValue, keyName);
+                    } catch (Throwable t) {
+                        XposedBridge.log("[TransparentTelegram] text key " + keyName
+                                + " not found (ok): " + t);
+                    }
+                }
+
                 keyNamesByValue = names;
-                backgroundKeys = keys;
-                XposedBridge.log("[TransparentTelegram] resolved " + keys.size()
-                        + " background keys lazily");
+                backgroundKeys = bgKeys;
+                textKeys = txtKeys;
+                XposedBridge.log("[TransparentTelegram] resolved lazily: bg="
+                        + bgKeys.size() + ", text=" + txtKeys.size());
             } catch (Throwable t) {
                 keysResolveFailed = true;
                 XposedBridge.log("[TransparentTelegram] resolveBackgroundKeys failed: " + t);
             }
         }
+    }
+
+    /** Тёмный ли цвет (низкая воспринимаемая яркость, Rec. 601). */
+    private static boolean isDarkColor(int color) {
+        int r = (color >> 16) & 0xFF;
+        int g = (color >> 8) & 0xFF;
+        int b = color & 0xFF;
+        int luminance = (r * 299 + g * 587 + b * 114) / 1000;
+        return luminance < 110;
     }
 
     @Override
@@ -160,24 +240,36 @@ public class HookEntry implements IXposedHookLoadPackage {
                     new XC_MethodHook() {
                         @Override
                         protected void afterHookedMethod(MethodHookParam param) {
-                            // Лениво разрешаем ключи при первом вызове,
-                            // когда Theme уже полностью инициализирован.
                             resolveBackgroundKeys(cl);
                             if (backgroundKeys == null) {
                                 return;
                             }
                             int key = (Integer) param.args[0];
-                            if (!backgroundKeys.contains(key)) {
+
+                            if (backgroundKeys.contains(key)) {
+                                int original = (Integer) param.getResult();
+                                if (Color.alpha(original) == 255) {
+                                    param.setResult(WINDOW_BACKGROUND_COLOR);
+                                    if (getColorPatchLogCount.incrementAndGet() <= 40) {
+                                        XposedBridge.log("[TransparentTelegram] BG getColor("
+                                                + keyNamesByValue.get(key) + "): "
+                                                + Integer.toHexString(original) + " -> "
+                                                + Integer.toHexString(WINDOW_BACKGROUND_COLOR));
+                                    }
+                                }
                                 return;
                             }
-                            int original = (Integer) param.getResult();
-                            if (Color.alpha(original) == 255) {
-                                param.setResult(WINDOW_BACKGROUND_COLOR);
-                                if (getColorPatchLogCount.incrementAndGet() <= 40) {
-                                    XposedBridge.log("[TransparentTelegram] Theme.getColor("
-                                            + keyNamesByValue.get(key) + "): "
-                                            + Integer.toHexString(original) + " -> "
-                                            + Integer.toHexString(WINDOW_BACKGROUND_COLOR));
+
+                            if (textKeys != null && textKeys.contains(key)) {
+                                int original = (Integer) param.getResult();
+                                if (Color.alpha(original) == 255 && isDarkColor(original)) {
+                                    param.setResult(TEXT_COLOR_LIGHT);
+                                    if (getColorPatchLogCount.incrementAndGet() <= 80) {
+                                        XposedBridge.log("[TransparentTelegram] TXT getColor("
+                                                + keyNamesByValue.get(key) + "): "
+                                                + Integer.toHexString(original) + " -> "
+                                                + Integer.toHexString(TEXT_COLOR_LIGHT));
+                                    }
                                 }
                             }
                         }
