@@ -24,27 +24,6 @@ import de.robv.android.xposed.XposedBridge;
 import de.robv.android.xposed.XposedHelpers;
 import de.robv.android.xposed.callbacks.XC_LoadPackage;
 
-/**
- * Transparent Telegram — универсальный LSPosed-модуль.
- *
- * Ключевые находки:
- * 1. Патч APK менял styles.xml (windowShowWallpaper + полупрозрачный
- *    windowBackground), ThemeColors.createDefaultColors() и пару
- *    методов в ThemeInfo/ChatActivity$ThemeDelegate.
- * 2. Вместо createDefaultColors() хукаем Theme.getColor(I[ZZ)I --
- *    универсальную точку запроса цвета по ключу, работает и для
- *    дефолтной, и для пользовательской темы.
- * 3. ВАЖНО: статические поля Theme.key_* НЕЛЬЗЯ читать в
- *    handleLoadPackage -- это триггерит <clinit> класса Theme до
- *    готовности Context и НАВСЕГДА ломает класс для всего процесса
- *    (NoClassDefFoundError -> краш приложения). Читаем лениво при
- *    первом вызове getColor().
- * 4. Тёмный текст на прозрачном фоне не читается -- инвертируем
- *    текстовые ключи на светлый цвет (только если исходный тёмный).
- * 5. Карточки-секции в настройках рисуют фон НЕ через Theme.getColor,
- *    а напрямую через View.setBackground / setBackgroundColor --
- *    ловим их отдельными хуками.
- */
 public class HookEntry implements IXposedHookLoadPackage {
 
     private static final Set<String> TARGET_PACKAGES = new HashSet<>(Arrays.asList(
@@ -65,16 +44,20 @@ public class HookEntry implements IXposedHookLoadPackage {
     private static final int BLUR_ALPHA = 0x40;
     private static final int TEXT_COLOR_LIGHT = Color.argb(0xFF, 0xEE, 0xEE, 0xEE);
 
-    // "Фоновые" ключи -- подменяем на полупрозрачный чёрный.
     private static final String[] BACKGROUND_KEY_NAMES = {
             "key_windowBackgroundWhite",
             "key_windowBackgroundGray",
             "key_windowBackgroundUnchecked",
             "key_actionBarDefault",
             "key_actionBarDefaultArchived",
+            "key_graySection",
+            "key_divider",
+            "key_listSelector",
+            "key_backgroundChecked",
+            "key_inactiveTab",
+            "key_inactiveTabActive",
     };
 
-    // Текстовые ключи -- инвертируем тёмный текст на светлый.
     private static final String[] TEXT_KEY_NAMES = {
             "key_windowBackgroundWhiteBlackText",
             "key_windowBackgroundWhiteGrayText",
@@ -112,9 +95,9 @@ public class HookEntry implements IXposedHookLoadPackage {
             "key_dialogTextBlue2",
             "key_dialogTextHint",
             "key_dialogTextRed",
+            "key_graySectionText",
     };
 
-    // --- Ленивое разрешение ключей ---
     private static volatile Set<Integer> backgroundKeys = null;
     private static volatile Set<Integer> textKeys = null;
     private static volatile Map<Integer, String> keyNamesByValue = null;
@@ -170,7 +153,6 @@ public class HookEntry implements IXposedHookLoadPackage {
         }
     }
 
-    /** Тёмный ли цвет (низкая воспринимаемая яркость, Rec. 601). */
     private static boolean isDarkColor(int color) {
         int r = (color >> 16) & 0xFF;
         int g = (color >> 8) & 0xFF;
@@ -189,10 +171,9 @@ public class HookEntry implements IXposedHookLoadPackage {
         final ClassLoader cl = lpparam.classLoader;
         XposedBridge.log("[TransparentTelegram] Loading: " + packageName);
 
-        // ---------- 1. Окно: LaunchActivity.onCreate / onResume ----------
+        // ---------- 1. LaunchActivity ----------
         try {
-            Class<?> launchActivityClass = XposedHelpers.findClass(
-                    LAUNCH_ACTIVITY_CLASS, cl);
+            Class<?> launchActivityClass = XposedHelpers.findClass(LAUNCH_ACTIVITY_CLASS, cl);
 
             XposedHelpers.findAndHookMethod(launchActivityClass, "onCreate", Bundle.class,
                     new XC_MethodHook() {
@@ -232,7 +213,7 @@ public class HookEntry implements IXposedHookLoadPackage {
             XposedBridge.log("[TransparentTelegram] LaunchActivity hook failed for " + packageName + ": " + t);
         }
 
-        // ---------- 2. Theme.getColor(I[ZZ)I -- главный универсальный хук ----------
+        // ---------- 2. Theme.getColor(I[ZZ)I ----------
         try {
             Class<?> themeClass = XposedHelpers.findClass(THEME_CLASS, cl);
 
@@ -242,13 +223,16 @@ public class HookEntry implements IXposedHookLoadPackage {
                         @Override
                         protected void afterHookedMethod(MethodHookParam param) {
                             resolveBackgroundKeys(cl);
-                            if (backgroundKeys == null) {
-                                return;
-                            }
+                            if (backgroundKeys == null) return;
                             int key = (Integer) param.args[0];
+                            int original = (Integer) param.getResult();
+
+                            if (Color.alpha(original) == 255) {
+                                XposedBridge.log("[TT-DIAG] getColor key=" + key
+                                        + " -> #" + Integer.toHexString(original));
+                            }
 
                             if (backgroundKeys.contains(key)) {
-                                int original = (Integer) param.getResult();
                                 if (Color.alpha(original) == 255) {
                                     param.setResult(WINDOW_BACKGROUND_COLOR);
                                     if (getColorPatchLogCount.incrementAndGet() <= 40) {
@@ -262,7 +246,6 @@ public class HookEntry implements IXposedHookLoadPackage {
                             }
 
                             if (textKeys != null && textKeys.contains(key)) {
-                                int original = (Integer) param.getResult();
                                 if (Color.alpha(original) == 255 && isDarkColor(original)) {
                                     param.setResult(TEXT_COLOR_LIGHT);
                                     if (getColorPatchLogCount.incrementAndGet() <= 80) {
@@ -280,9 +263,70 @@ public class HookEntry implements IXposedHookLoadPackage {
             XposedBridge.log("[TransparentTelegram] Theme.getColor hook failed for " + packageName + ": " + t);
         }
 
-        // ---------- 2b. View.setBackgroundColor / setBackground ----------
-        // Ловит карточки-секции в настройках и другие View, которым фон
-        // ставится напрямую, минуя Theme.getColor.
+        // ---------- 2b. Theme.getColor -- остальные перегрузки ----------
+        try {
+            Class<?> themeClass = XposedHelpers.findClass(THEME_CLASS, cl);
+
+            try {
+                XposedHelpers.findAndHookMethod(themeClass, "getColor", int.class,
+                        new XC_MethodHook() {
+                            @Override
+                            protected void afterHookedMethod(MethodHookParam param) {
+                                resolveBackgroundKeys(cl);
+                                if (backgroundKeys == null) return;
+                                int key = (Integer) param.args[0];
+                                int original = (Integer) param.getResult();
+
+                                if (Color.alpha(original) == 255) {
+                                    XposedBridge.log("[TT-DIAG] getColor(int) key=" + key
+                                            + " -> #" + Integer.toHexString(original));
+                                }
+
+                                if (backgroundKeys.contains(key) && Color.alpha(original) == 255) {
+                                    param.setResult(WINDOW_BACKGROUND_COLOR);
+                                } else if (textKeys != null && textKeys.contains(key)
+                                        && Color.alpha(original) == 255 && isDarkColor(original)) {
+                                    param.setResult(TEXT_COLOR_LIGHT);
+                                }
+                            }
+                        });
+                XposedBridge.log("[TransparentTelegram] getColor(int) hooked");
+            } catch (Throwable t) {
+                XposedBridge.log("[TransparentTelegram] getColor(int) hook failed: " + t);
+            }
+
+            try {
+                XposedHelpers.findAndHookMethod(themeClass, "getColor", int.class, boolean[].class,
+                        new XC_MethodHook() {
+                            @Override
+                            protected void afterHookedMethod(MethodHookParam param) {
+                                resolveBackgroundKeys(cl);
+                                if (backgroundKeys == null) return;
+                                int key = (Integer) param.args[0];
+                                int original = (Integer) param.getResult();
+
+                                if (Color.alpha(original) == 255) {
+                                    XposedBridge.log("[TT-DIAG] getColor(int,[]) key=" + key
+                                            + " -> #" + Integer.toHexString(original));
+                                }
+
+                                if (backgroundKeys.contains(key) && Color.alpha(original) == 255) {
+                                    param.setResult(WINDOW_BACKGROUND_COLOR);
+                                } else if (textKeys != null && textKeys.contains(key)
+                                        && Color.alpha(original) == 255 && isDarkColor(original)) {
+                                    param.setResult(TEXT_COLOR_LIGHT);
+                                }
+                            }
+                        });
+                XposedBridge.log("[TransparentTelegram] getColor(int, boolean[]) hooked");
+            } catch (Throwable t) {
+                XposedBridge.log("[TransparentTelegram] getColor(int, boolean[]) hook failed: " + t);
+            }
+        } catch (Throwable t) {
+            XposedBridge.log("[TransparentTelegram] getColor overloads hook failed: " + t);
+        }
+
+        // ---------- 2c. View.setBackgroundColor / setBackground ----------
         try {
             XposedHelpers.findAndHookMethod(View.class, "setBackgroundColor", int.class,
                     new XC_MethodHook() {
@@ -328,6 +372,61 @@ public class HookEntry implements IXposedHookLoadPackage {
             XposedBridge.log("[TransparentTelegram] View background hooks failed for " + packageName + ": " + t);
         }
 
+        // ---------- 2d. Canvas.drawColor / drawRect -- добиваем тёмные плашки ----------
+        try {
+            // drawColor(int)
+            XposedHelpers.findAndHookMethod(android.graphics.Canvas.class, "drawColor", int.class,
+                    new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            try {
+                                int c = (Integer) param.args[0];
+                                if (Color.alpha(c) == 255 && isDarkColor(c)) {
+                                    param.args[0] = WINDOW_BACKGROUND_COLOR;
+                                }
+                            } catch (Throwable ignored) {}
+                        }
+                    });
+
+            // drawRect(float, float, float, float, Paint)
+            XposedHelpers.findAndHookMethod(android.graphics.Canvas.class, "drawRect",
+                    float.class, float.class, float.class, float.class, android.graphics.Paint.class,
+                    new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            try {
+                                android.graphics.Paint paint = (android.graphics.Paint) param.args[4];
+                                if (paint == null) return;
+                                int c = paint.getColor();
+                                if (Color.alpha(c) == 255 && isDarkColor(c)) {
+                                    paint.setColor(WINDOW_BACKGROUND_COLOR);
+                                }
+                            } catch (Throwable ignored) {}
+                        }
+                    });
+
+            // drawRect(RectF, Paint)
+            XposedHelpers.findAndHookMethod(android.graphics.Canvas.class, "drawRect",
+                    android.graphics.RectF.class, android.graphics.Paint.class,
+                    new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            try {
+                                android.graphics.Paint paint = (android.graphics.Paint) param.args[1];
+                                if (paint == null) return;
+                                int c = paint.getColor();
+                                if (Color.alpha(c) == 255 && isDarkColor(c)) {
+                                    paint.setColor(WINDOW_BACKGROUND_COLOR);
+                                }
+                            } catch (Throwable ignored) {}
+                        }
+                    });
+
+            XposedBridge.log("[TransparentTelegram] Canvas hooks installed for " + packageName);
+        } catch (Throwable t) {
+            XposedBridge.log("[TransparentTelegram] Canvas hooks failed for " + packageName + ": " + t);
+        }
+
         // ---------- 3. ActionBar.setBackgroundColor ----------
         try {
             Class<?> actionBarClass = XposedHelpers.findClass(
@@ -338,7 +437,7 @@ public class HookEntry implements IXposedHookLoadPackage {
                         protected void beforeHookedMethod(MethodHookParam param) {
                             int original = (Integer) param.args[0];
                             if (Color.alpha(original) == 255) {
-                                param.args[0] = (original & 0x00FFFFFF) | (ALPHA << 24);
+                                param.args[0] = WINDOW_BACKGROUND_COLOR;
                             }
                         }
                     });
@@ -347,11 +446,10 @@ public class HookEntry implements IXposedHookLoadPackage {
             XposedBridge.log("[TransparentTelegram] ActionBar hook failed for " + packageName + ": " + t);
         }
 
-        // ---------- 4. blur3: BlurredBackgroundSourceColor.setColor ----------
+        // ---------- 4. BlurredBackgroundSourceColor.setColor ----------
         try {
             Class<?> sourceColorClass = XposedHelpers.findClass(
-                    "org.telegram.ui.Components.blur3.source.BlurredBackgroundSourceColor",
-                    cl);
+                    "org.telegram.ui.Components.blur3.source.BlurredBackgroundSourceColor", cl);
             XposedHelpers.findAndHookMethod(sourceColorClass, "setColor", int.class,
                     new XC_MethodHook() {
                         @Override
@@ -367,11 +465,10 @@ public class HookEntry implements IXposedHookLoadPackage {
             XposedBridge.log("[TransparentTelegram] BlurredBackgroundSourceColor hook failed for " + packageName + ": " + t);
         }
 
-        // ---------- 5. blur3: BlurredBackgroundColorProviderThemed ----------
+        // ---------- 5. BlurredBackgroundColorProviderThemed ----------
         try {
             Class<?> providerClass = XposedHelpers.findClass(
-                    "org.telegram.ui.Components.blur3.drawable.color.BlurredBackgroundColorProviderThemed",
-                    cl);
+                    "org.telegram.ui.Components.blur3.drawable.color.BlurredBackgroundColorProviderThemed", cl);
             for (String methodName : new String[]{
                     "getBackgroundColor", "getStrokeColorTop", "getStrokeColorBottom"}) {
                 try {
@@ -394,11 +491,10 @@ public class HookEntry implements IXposedHookLoadPackage {
             XposedBridge.log("[TransparentTelegram] BlurredBackgroundColorProviderThemed hook failed for " + packageName + ": " + t);
         }
 
-        // ---------- 6. blur3: DialogsActivityTopBubblesFadeView.setColor ----------
+        // ---------- 6. DialogsActivityTopBubblesFadeView.setColor ----------
         try {
             Class<?> fadeViewClass = XposedHelpers.findClass(
-                    "org.telegram.ui.Components.DialogsActivityTopBubblesFadeView",
-                    cl);
+                    "org.telegram.ui.Components.DialogsActivityTopBubblesFadeView", cl);
             XposedHelpers.findAndHookMethod(fadeViewClass, "setColor", int.class,
                     new XC_MethodHook() {
                         @Override
