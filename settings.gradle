@@ -10,7 +10,6 @@ dependencyResolutionManagement {
     repositories {
         google()
         mavenCentral()
-        // Репозиторий с Xposed API (rovo89), нужен для compileOnly-зависимости ниже
         maven { url 'https://api.xposed.info/' }
     }
 }

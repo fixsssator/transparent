@@ -19,15 +19,17 @@ public class AboutActivity extends Activity {
         sb.append("2. Установите этот APK.\n");
         sb.append("3. В LSPosed Manager -> Modules включите модуль и отметьте " +
                 "нужные приложения в Scope.\n");
-        sb.append("4. Перезапустите отмеченные приложения.\n\n");
+        sb.append("4. Перезапустите отмеченные приложения (force stop).\n\n");
         sb.append("Список приложений, для которых хук прописан в коде " +
-                "(HookEntry.TARGET_PACKAGES) — они же имеет смысл отмечать в Scope:\n");
-        for (String pkg : getResources().getStringArray(R.array.target_packages)) {
-            sb.append("• ").append(pkg).append("\n");
+                "(HookEntry.TARGET_PACKAGES) — их же имеет смысл отмечать в Scope:\n");
+        try {
+            for (String pkg : getResources().getStringArray(R.array.target_packages)) {
+                sb.append("• ").append(pkg).append("\n");
+            }
+        } catch (Throwable ignored) {
         }
-        sb.append("\nЕсли эффекта нет — приложение из Scope не соответствует ожидаемому " +
-                "внутреннему классу org.telegram.ui.LaunchActivity, смотрите логи " +
-                "через LSPosed Manager -> Logs.");
+        sb.append("\nЕсли эффекта нет — смотрите логи через LSPosed Manager -> Logs, " +
+                "строки начинаются с \"[TransparentTelegram]\".");
 
         tv.setText(sb.toString());
         setContentView(tv);

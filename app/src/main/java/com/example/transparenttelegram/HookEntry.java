@@ -12,7 +12,9 @@ import android.view.Window;
 import android.view.WindowManager;
 
 import java.util.Arrays;
+import java.util.HashMap;
 import java.util.HashSet;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -23,28 +25,39 @@ import de.robv.android.xposed.XposedHelpers;
 import de.robv.android.xposed.callbacks.XC_LoadPackage;
 
 /**
- * ДИАГНОСТИЧЕСКАЯ версия. Прежние 2 попытки (флаги/фон окна, затем
- * + setFormat(TRANSLUCENT)) выполнялись без единого исключения
- * (подтверждено логами LSPosed на реальном устройстве: "Hooks installed",
- * "Window prepared", множество "Transparency applied" без единого
- * "failed"), но визуально ничего не менялось. Значит наш код в принципе
- * доходит до нужных точек, но либо:
- *   а) что-то перерисовывает поверх ПОСЛЕ нас (асинхронно, после
- *      onResume -- например отложенная загрузка темы/обоев Telegram),
- *   б) реальный "непрозрачный слой" рисуется не в Window/DecorView и не
- *      в первых 1-2 уровнях View, а глубже в иерархии, куда предыдущая
- *      версия не доставала.
+ * Transparent Telegram — универсальный LSPosed-модуль.
  *
- * Вместо того чтобы гадать дальше вслепую, эта версия ОДИН РАЗ (через
- * 1.5 сек после onResume, чтобы дать Telegram время на асинхронную
- * инициализацию темы) дампит в лог LSPosed реальное состояние: флаги
- * окна, фон/альфу DecorView и всех его потомков на нескольких уровнях
- * вглубь. По этому логу будет видно ТОЧНО, какой View рисует
- * непрозрачный слой -- дальше патчим прицельно именно его, а не всё
- * подряд.
+ * История находок (коротко, для будущего себя/других):
+ * 1. Оригинальный "авторский" патч APK менял ТРИ вещи:
+ *    a) res/values/styles.xml и все values-vNN styles.xml (квалифаеры версий!) --
+ *       windowShowWallpaper=true + полупрозрачный windowBackground/colorBackground.
+ *       Это НЕОБХОДИМО, но на Android 15+ (edge-to-edge) само по себе
+ *       НЕДОСТАТОЧНО -- окно всё равно не становится по-настоящему
+ *       прозрачным без явного рантайм-вызова Window.setFormat(TRANSLUCENT).
+ *    b) org/telegram/ui/ActionBar/ThemeColors.createDefaultColors() --
+ *       хардкод ДЕФОЛТНЫХ цветов темы (key_windowBackgroundWhite,
+ *       key_windowBackgroundGray, key_windowBackgroundUnchecked,
+ *       key_actionBarDefault и т.д.) на #80000000. Это и есть настоящий
+ *       фундаментальный источник "белых стен" -- НЕ blur3/glass-система,
+ *       которую мы долго и безуспешно пытались пробить отдельными хуками.
+ *    c) Theme$ThemeInfo.getPreviewBackgroundColor() и
+ *       ChatActivity$ThemeDelegate.getBackgroundDrawableFromTheme() --
+ *       более мелкие, но тоже реальные точки с тем же цветом.
  *
- * Как читать лог: LSPosed Manager -> Logs, искать "[TransparentTelegram]
- * [DIAG]". Нужен весь блок целиком (может быть длинным).
+ * 2. Вместо того чтобы хукать createDefaultColors() (создаётся один раз
+ *    при старте, дальше активная тема может брать цвета из СВОЕГО набора,
+ *    а не из дефолтного массива) -- хукаем Theme.getColor(I[ZZ)I,
+ *    универсальную точку, через которую ЛЮБОЙ код приложения запрашивает
+ *    цвет темы по ключу, независимо от того, дефолтная тема сейчас
+ *    активна или пользовательская. Для конкретного списка "фоновых"
+ *    ключей подменяем результат на наш цвет.
+ *
+ * 3. Специфичные для blur3/glass-рендеринга хуки (ActionBar.setBackgroundColor,
+ *    BlurredBackgroundSourceColor.setColor, BlurredBackgroundColorProviderThemed,
+ *    DialogsActivityTopBubblesFadeView.setColor) оставлены как
+ *    дополнительная подстраховка для конкретных decorative-элементов
+ *    (блюр под шапкой/вкладками), которые НЕ читают цвет через
+ *    Theme.getColor() напрямую, а держат свой собственный Paint.
  */
 public class HookEntry implements IXposedHookLoadPackage {
 
@@ -59,51 +72,27 @@ public class HookEntry implements IXposedHookLoadPackage {
     ));
 
     private static final String LAUNCH_ACTIVITY_CLASS = "org.telegram.ui.LaunchActivity";
-
-    // Счётчик срабатываний диагностического хука Paint.setColor -- ограничиваем,
-    // чтобы не залить лог (setColor может вызываться тысячи раз за кадр).
-    private static final AtomicInteger paintDiagCount = new AtomicInteger(0);
-
-    // Аналогично ограничиваем ЛОГИРОВАНИЕ (не саму правку) для draw()-хука,
-    // который может вызываться на каждый кадр.
-    private static final AtomicInteger drawFixLogCount = new AtomicInteger(0);
-
-    // Аналогично для логов сброса кэша display-list у RenderNode.
-    private static final AtomicInteger renderNodeFixLogCount = new AtomicInteger(0);
-
-    // Аналогично для универсального хука Canvas.drawRect.
-    private static final AtomicInteger canvasFixLogCount = new AtomicInteger(0);
-
-    // Аналогично для drawRoundRect и drawPath.
-    private static final AtomicInteger roundRectFixLogCount = new AtomicInteger(0);
-    private static final AtomicInteger pathFixLogCount = new AtomicInteger(0);
-
-    // Диагностика drawBitmap -- не фикс, только счётчик логов.
-    private static final AtomicInteger bitmapDiagCount = new AtomicInteger(0);
+    private static final String THEME_CLASS = "org.telegram.ui.ActionBar.Theme";
 
     private static final int ALPHA = 0x80;
     private static final int WINDOW_BACKGROUND_COLOR = Color.argb(ALPHA, 0, 0, 0);
-
-    // ================================================================
-    // ВРЕМЕННЫЙ ДИАГНОСТИЧЕСКИЙ ФЛАГ: если true, ВСЕ хуки, что заменяют
-    // цвет на WINDOW_BACKGROUND_COLOR, вместо этого красят в кричащий
-    // непрозрачный малиновый -- чтобы визуально увидеть, что из
-    // подтверждённо срабатывающих хуков реально влияет на экран, а что
-    // патчит невидимый/неактивный элемент. Верните false перед финальной
-    // сборкой.
-    // ================================================================
-    private static final boolean FLAG_COLOR_DEBUG = true;
-    private static final int FLAG_COLOR = Color.argb(255, 255, 0, 220); // кричащий малиновый, alpha=255
-
-    private static int debugColor(int normalColor) {
-        return FLAG_COLOR_DEBUG ? FLAG_COLOR : normalColor;
-    }
-    // Блюр-плашки (BlurredBackgroundWithFadeDrawable и т.п.) под статус-баром/
-    // шапкой блюрят реальную обоину + свой fade-тон -- смотрится "пересвеченно",
-    // если оставить как есть. Приглушаем сильнее, чем обычную стену.
     private static final int BLUR_ALPHA = 0x40;
-    private static final int MAX_DEPTH = 12;      // насколько глубоко логируем дерево View
-    private static final int MAX_CHILDREN = 12;   // максимум детей на уровень (чтобы не залить лог)
+
+    // Ключи Theme.key_* (статические int-поля), значения которых считаем
+    // "фоновой стеной" и подменяем безусловно. Имена читаем через
+    // рефлексию в handleLoadPackage -- если какого-то ключа нет в
+    // конкретной версии/форке, просто пропускаем его без падения.
+    private static final String[] BACKGROUND_KEY_NAMES = {
+            "key_windowBackgroundWhite",
+            "key_windowBackgroundGray",
+            "key_windowBackgroundUnchecked",
+            "key_actionBarDefault",
+            "key_actionBarDefaultArchived",
+            "key_windowBackgroundWhiteBlackText", // на случай текстовых контейнеров с тем же фоном
+    };
+
+    private static final AtomicInteger getColorPatchLogCount = new AtomicInteger(0);
+    private static final AtomicInteger drawFixLogCount = new AtomicInteger(0);
 
     @Override
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) {
@@ -114,496 +103,10 @@ public class HookEntry implements IXposedHookLoadPackage {
         final String packageName = lpparam.packageName;
         XposedBridge.log("[TransparentTelegram] Loading: " + packageName);
 
+        // ---------- 1. Окно: LaunchActivity.onCreate / onResume ----------
         try {
             Class<?> launchActivityClass = XposedHelpers.findClass(
                     LAUNCH_ACTIVITY_CLASS, lpparam.classLoader);
-
-            // Отдельный, гораздо более точный хук: ActionBar.setBackgroundColor()
-            // ПЕРЕОПРЕДЕЛЁН и НЕ создаёт обычный background-Drawable (см. смали:
-            // просто сохраняет цвет в поле actionBarColor и красит Paint'ом в
-            // dispatchDraw()) -- поэтому обход дерева (stripOpaqueBackgrounds)
-            // его в принципе не видит, getBackground() всегда null. Ловим сам
-            // сеттер -- сработает для ЛЮБОГО экрана (Настройки, список чатов,
-            // чат), независимо от того, когда и сколько раз он вызывается.
-            try {
-                Class<?> actionBarClass = XposedHelpers.findClass(
-                        "org.telegram.ui.ActionBar.ActionBar", lpparam.classLoader);
-                XposedHelpers.findAndHookMethod(actionBarClass, "setBackgroundColor", int.class,
-                        new XC_MethodHook() {
-                            @Override
-                            protected void beforeHookedMethod(MethodHookParam param) {
-                                int original = (Integer) param.args[0];
-                                if (Color.alpha(original) == 255) {
-                                    int patched = (original & 0x00FFFFFF) | (ALPHA << 24);
-                                    param.args[0] = patched;
-                                    XposedBridge.log("[TransparentTelegram] ActionBar.setBackgroundColor: "
-                                            + Integer.toHexString(original) + " -> " + Integer.toHexString(patched)
-                                            + " (instance " + param.thisObject.getClass().getName() + ")");
-                                } else {
-                                    XposedBridge.log("[TransparentTelegram] ActionBar.setBackgroundColor пропущен (уже не opaque): "
-                                            + Integer.toHexString(original));
-                                }
-                            }
-                        });
-                XposedBridge.log("[TransparentTelegram] ActionBar.setBackgroundColor hook installed for " + packageName);
-            } catch (Throwable t) {
-                XposedBridge.log("[TransparentTelegram] ActionBar hook failed for " + packageName + ": " + t);
-            }
-
-            // НОВЫЙ, современный механизм ("glass"-редизайн): ActionBar в
-            // этой версии красит себя НЕ через setBackgroundColor(), а через
-            // setupGlass(...)/setDrawBlurBackground(...), которые берут цвет
-            // из отдельного объекта BlurredBackgroundColorProvider (интерфейс
-            // с методом getBackgroundColor()) -- он опрашивается каждый раз
-            // при отрисовке блюра. Хук на setBackgroundColor его вообще не
-            // видит -- нужно ловить именно этот провайдер. Хукаем конкретную
-            // реализацию (интерфейсы напрямую не хукаются в classic Xposed API).
-            try {
-                Class<?> providerClass = XposedHelpers.findClass(
-                        "org.telegram.ui.Components.blur3.drawable.color.BlurredBackgroundColorProviderThemed",
-                        lpparam.classLoader);
-                // Хукаем ВСЕ 4 метода интерфейса, не только getBackgroundColor()
-                // (который, как выяснилось, для видимой шапки ни разу не вызывается).
-                // Гипотеза: видимая "белая" область -- это не заливка фона, а
-                // отдельный светлый STROKE/блик поверх (типичный приём в
-                // "стеклянном" UI - имитация блика на кромке стекла), рисуемый
-                // ДРУГИМ методом этого же провайдера, поверх уже правильно
-                // патченной заливки -- отсюда ощущение "нахлёста двух прозрачностей".
-                for (String methodName : new String[]{
-                        "getBackgroundColor", "getShadowColor", "getStrokeColorTop", "getStrokeColorBottom"}) {
-                    try {
-                        XposedHelpers.findAndHookMethod(providerClass, methodName,
-                                new XC_MethodHook() {
-                                    @Override
-                                    protected void afterHookedMethod(MethodHookParam param) {
-                                        int original = (Integer) param.getResult();
-                                        if (Color.alpha(original) == 255) {
-                                            int patched = debugColor(WINDOW_BACKGROUND_COLOR);
-                                            param.setResult(patched);
-                                            XposedBridge.log("[TransparentTelegram] BlurredBackgroundColorProviderThemed." + methodName + ": "
-                                                    + Integer.toHexString(original) + " -> " + Integer.toHexString(patched));
-                                        }
-                                    }
-                                });
-                    } catch (Throwable t) {
-                        XposedBridge.log("[TransparentTelegram] hook for " + methodName + " failed: " + t);
-                    }
-                }
-                XposedBridge.log("[TransparentTelegram] BlurredBackgroundColorProviderThemed hook installed for " + packageName);
-            } catch (Throwable t) {
-                XposedBridge.log("[TransparentTelegram] BlurredBackgroundColorProviderThemed hook failed for " + packageName + ": " + t);
-            }
-
-            // НАСТОЯЩИЙ универсальный источник цвета для blur3-рендеринга,
-            // найден через диагностику Paint.setColor + анализ стека вызова:
-            // BlurredBackgroundSourceColor.setColor(int) сохраняет цвет в
-            // приватный Paint, а draw(Canvas,l,t,r,b) заливает им прямоугольник
-            // через canvas.drawRect(...) -- это и есть реальная заливка фона
-            // для ЛЮБОГО blur3-компонента (шапка, вкладки, поиск и т.д.),
-            // реализующего интерфейс BlurredBackgroundSource. В отличие от
-            // ActionBar.setBackgroundColor и BlurredBackgroundColorProviderThemed
-            // (оба ставились, но ни разу не вызывались для видимой шапки) --
-            // этот метод подтверждённо вызывается (10 раз в диагностике).
-            try {
-                Class<?> sourceColorClass = XposedHelpers.findClass(
-                        "org.telegram.ui.Components.blur3.source.BlurredBackgroundSourceColor",
-                        lpparam.classLoader);
-                XposedHelpers.findAndHookMethod(sourceColorClass, "setColor", int.class,
-                        new XC_MethodHook() {
-                            @Override
-                            protected void beforeHookedMethod(MethodHookParam param) {
-                                int original = (Integer) param.args[0];
-                                if (Color.alpha(original) == 255) {
-                                    // ВАЖНО: не просто снижаем альфу исходному цвету --
-                                    // если исходный цвет светлый/белый (как здесь,
-                                    // #ffffffff), то даже 50%-альфа белого поверх
-                                    // обоины всё равно даёт светлый/белёсый результат
-                                    // (это математика смешивания цветов, не баг хука).
-                                    // ПОЛНОСТЬЮ ЗАМЕНЯЕМ на тот же фиксированный тёмный
-                                    // тон, что и везде остальное (WINDOW_BACKGROUND_COLOR) --
-                                    // тот же приём, что уже работает для обычных "стен".
-                                    param.args[0] = debugColor(WINDOW_BACKGROUND_COLOR);
-                                    XposedBridge.log("[TransparentTelegram] BlurredBackgroundSourceColor.setColor: "
-                                            + Integer.toHexString(original) + " -> " + Integer.toHexString(debugColor(WINDOW_BACKGROUND_COLOR)));
-                                }
-                            }
-                        });
-                XposedBridge.log("[TransparentTelegram] BlurredBackgroundSourceColor hook installed for " + packageName);
-            } catch (Throwable t) {
-                XposedBridge.log("[TransparentTelegram] BlurredBackgroundSourceColor hook failed for " + packageName + ": " + t);
-            }
-
-            // ДОПОЛНИТЕЛЬНО (на случай, если setColor() кэшируется в GPU
-            // RenderNode и не обновляет уже записанный список команд отрисовки):
-            // перехватываем сам draw(Canvas,l,t,r,b) -- он вызывает
-            // canvas.drawRect(l,t,r,b,paint) при КАЖДОМ кадре, так что правка
-            // цвета внутреннего Paint прямо перед этим вызовом гарантированно
-            // попадает в то, что реально рисуется, а не в промежуточное
-            // состояние объекта.
-            try {
-                Class<?> sourceColorClass2 = XposedHelpers.findClass(
-                        "org.telegram.ui.Components.blur3.source.BlurredBackgroundSourceColor",
-                        lpparam.classLoader);
-                XposedHelpers.findAndHookMethod(sourceColorClass2, "draw",
-                        android.graphics.Canvas.class, float.class, float.class, float.class, float.class,
-                        new XC_MethodHook() {
-                            @Override
-                            protected void beforeHookedMethod(MethodHookParam param) {
-                                try {
-                                    Object paintObj = XposedHelpers.getObjectField(param.thisObject, "paint");
-                                    android.graphics.Paint paint = (android.graphics.Paint) paintObj;
-                                    int current = paint.getColor();
-                                    if (Color.alpha(current) == 255) {
-                                        paint.setColor(debugColor(WINDOW_BACKGROUND_COLOR));
-                                        if (drawFixLogCount.incrementAndGet() <= 20) {
-                                            XposedBridge.log("[TransparentTelegram] BlurredBackgroundSourceColor.draw: forced paint color "
-                                                    + Integer.toHexString(current) + " -> " + Integer.toHexString(debugColor(WINDOW_BACKGROUND_COLOR)));
-                                        }
-                                    }
-                                } catch (Throwable t) {
-                                    XposedBridge.log("[TransparentTelegram] draw() paint patch failed: " + t);
-                                }
-                            }
-                        });
-                XposedBridge.log("[TransparentTelegram] BlurredBackgroundSourceColor.draw hook installed for " + packageName);
-            } catch (Throwable t) {
-                XposedBridge.log("[TransparentTelegram] BlurredBackgroundSourceColor.draw hook failed for " + packageName + ": " + t);
-            }
-
-            // ГЛАВНЫЙ ФИКС: BlurredBackgroundDrawableRenderNode кэширует
-            // GPU display-list (updateDisplayList()/hasDisplayList()) и просто
-            // ПЕРЕИГРЫВАЕТ уже записанную картинку при каждой отрисовке --
-            // не перечитывая исходный цвет заново. Наш патч цвета в
-            // BlurredBackgroundSourceColor происходит ПОСЛЕ этой записи,
-            // поэтому визуально ничего не менялось, хотя код формально
-            // отрабатывал. Принудительно сбрасываем кэш (invalidateDisplayList())
-            // перед каждой отрисовкой -- тогда display-list перезапишется
-            // заново, уже с патченным цветом.
-            try {
-                Class<?> renderNodeClass = XposedHelpers.findClass(
-                        "org.telegram.ui.Components.blur3.drawable.BlurredBackgroundDrawableRenderNode",
-                        lpparam.classLoader);
-                XposedHelpers.findAndHookMethod(renderNodeClass, "draw", android.graphics.Canvas.class,
-                        new XC_MethodHook() {
-                            @Override
-                            protected void beforeHookedMethod(MethodHookParam param) {
-                                try {
-                                    XposedHelpers.callMethod(param.thisObject, "invalidateDisplayList");
-                                    if (renderNodeFixLogCount.incrementAndGet() <= 20) {
-                                        XposedBridge.log("[TransparentTelegram] BlurredBackgroundDrawableRenderNode: display list invalidated");
-                                    }
-                                } catch (Throwable t) {
-                                    XposedBridge.log("[TransparentTelegram] invalidateDisplayList failed: " + t);
-                                }
-                            }
-                        });
-                XposedBridge.log("[TransparentTelegram] BlurredBackgroundDrawableRenderNode hook installed for " + packageName);
-            } catch (Throwable t) {
-                XposedBridge.log("[TransparentTelegram] BlurredBackgroundDrawableRenderNode hook failed for " + packageName + ": " + t);
-            }
-
-            // Найдено сопоставлением скриншота с координатами из [DIAG]-дампа:
-            // белая область сверху (шапка + "затухание" под лентой историй)
-            // рисуется НЕ через blur3/glass систему вообще, а отдельным
-            // классом DialogsActivityTopBubblesFadeView, который строит
-            // LinearGradient(color -> transparent) и красит им фон через
-            // Paint.setShader() -- поэтому НИ ОДИН из хуков на setColor()
-            // (которые проверяют итоговый Paint.getColor()) не мог это
-            // поймать: цвет тут используется только как ВХОДНОЕ значение
-            // для построения градиента, а не как прямой цвет заливки.
-            try {
-                Class<?> fadeViewClass = XposedHelpers.findClass(
-                        "org.telegram.ui.Components.DialogsActivityTopBubblesFadeView",
-                        lpparam.classLoader);
-                XposedHelpers.findAndHookMethod(fadeViewClass, "setColor", int.class,
-                        new XC_MethodHook() {
-                            @Override
-                            protected void beforeHookedMethod(MethodHookParam param) {
-                                int original = (Integer) param.args[0];
-                                if (Color.alpha(original) == 255) {
-                                    int patched = debugColor(WINDOW_BACKGROUND_COLOR);
-                                    param.args[0] = patched;
-                                    XposedBridge.log("[TransparentTelegram] DialogsActivityTopBubblesFadeView.setColor: "
-                                            + Integer.toHexString(original) + " -> " + Integer.toHexString(patched));
-                                }
-                            }
-                        });
-                XposedBridge.log("[TransparentTelegram] DialogsActivityTopBubblesFadeView hook installed for " + packageName);
-            } catch (Throwable t) {
-                XposedBridge.log("[TransparentTelegram] DialogsActivityTopBubblesFadeView hook failed for " + packageName + ": " + t);
-            }
-
-            // ============================================================
-            // САМЫЙ УНИВЕРСАЛЬНЫЙ ФИКС: перехватываем сам Canvas.drawRect()
-            // с Paint -- это финальная точка перед тем, как пиксели реально
-            // попадают на экран, независимо от того, какой класс/абстракция
-            // до этого крутила цвета (setColor, shader, RenderNode и т.д.).
-            // Если Paint в момент вызова светлый и непрозрачный -- меняем
-            // его цвет ПРЯМО ПЕРЕД отрисовкой. Это должно поймать вообще
-            // любой механизм закраски, включая те, что мы ещё не нашли.
-            // ============================================================
-            try {
-                XposedHelpers.findAndHookMethod(android.graphics.Canvas.class, "drawRect",
-                        float.class, float.class, float.class, float.class, android.graphics.Paint.class,
-                        new XC_MethodHook() {
-                            @Override
-                            protected void beforeHookedMethod(MethodHookParam param) {
-                                android.graphics.Paint paint = (android.graphics.Paint) param.args[4];
-                                int color = paint.getColor();
-                                if (Color.alpha(color) > 200 && Color.red(color) > 180
-                                        && Color.green(color) > 180 && Color.blue(color) > 180
-                                        && paint.getShader() == null) {
-                                    paint.setColor(debugColor(WINDOW_BACKGROUND_COLOR));
-                                    if (canvasFixLogCount.incrementAndGet() <= 30) {
-                                        XposedBridge.log("[TransparentTelegram] Canvas.drawRect: forced light paint "
-                                                + Integer.toHexString(color) + " -> " + Integer.toHexString(debugColor(WINDOW_BACKGROUND_COLOR))
-                                                + " rect=(" + param.args[0] + "," + param.args[1] + "," + param.args[2] + "," + param.args[3] + ")");
-                                    }
-                                }
-                            }
-                        });
-                XposedBridge.log("[TransparentTelegram] Canvas.drawRect universal hook installed for " + packageName);
-            } catch (Throwable t) {
-                XposedBridge.log("[TransparentTelegram] Canvas.drawRect universal hook failed for " + packageName + ": " + t);
-            }
-
-            // Скруглённые карточки (Настройки: Accounts, список настроек,
-            // Premium) обычно рисуются через drawRoundRect(), а не drawRect() --
-            // отдельный метод Canvas, который наш предыдущий хук не ловил.
-            try {
-                XC_MethodHook roundRectHook = new XC_MethodHook() {
-                    @Override
-                    protected void beforeHookedMethod(MethodHookParam param) {
-                        // Paint -- последний аргумент в обоих перегрузках ниже.
-                        Object lastArg = param.args[param.args.length - 1];
-                        if (!(lastArg instanceof android.graphics.Paint)) {
-                            return;
-                        }
-                        android.graphics.Paint paint = (android.graphics.Paint) lastArg;
-                        int color = paint.getColor();
-                        if (Color.alpha(color) > 200 && Color.red(color) > 180
-                                && Color.green(color) > 180 && Color.blue(color) > 180
-                                && paint.getShader() == null) {
-                            paint.setColor(debugColor(WINDOW_BACKGROUND_COLOR));
-                            if (roundRectFixLogCount.incrementAndGet() <= 30) {
-                                XposedBridge.log("[TransparentTelegram] Canvas.drawRoundRect: forced light paint "
-                                        + Integer.toHexString(color) + " -> " + Integer.toHexString(debugColor(WINDOW_BACKGROUND_COLOR)));
-                            }
-                        }
-                    }
-                };
-                // перегрузка (left, top, right, bottom, rx, ry, Paint)
-                XposedHelpers.findAndHookMethod(android.graphics.Canvas.class, "drawRoundRect",
-                        float.class, float.class, float.class, float.class, float.class, float.class,
-                        android.graphics.Paint.class, roundRectHook);
-                // перегрузка (RectF, rx, ry, Paint)
-                XposedHelpers.findAndHookMethod(android.graphics.Canvas.class, "drawRoundRect",
-                        android.graphics.RectF.class, float.class, float.class,
-                        android.graphics.Paint.class, roundRectHook);
-                XposedBridge.log("[TransparentTelegram] Canvas.drawRoundRect universal hook installed for " + packageName);
-            } catch (Throwable t) {
-                XposedBridge.log("[TransparentTelegram] Canvas.drawRoundRect universal hook failed for " + packageName + ": " + t);
-            }
-
-            // Ещё один способ рисовать скруглённые карточки -- через
-            // Path (canvas.drawPath(path, paint)), особенно если у карточки
-            // разные радиусы на разных углах.
-            try {
-                XposedHelpers.findAndHookMethod(android.graphics.Canvas.class, "drawPath",
-                        android.graphics.Path.class, android.graphics.Paint.class,
-                        new XC_MethodHook() {
-                            @Override
-                            protected void beforeHookedMethod(MethodHookParam param) {
-                                android.graphics.Paint paint = (android.graphics.Paint) param.args[1];
-                                int color = paint.getColor();
-                                if (Color.alpha(color) > 200 && Color.red(color) > 180
-                                        && Color.green(color) > 180 && Color.blue(color) > 180
-                                        && paint.getShader() == null
-                                        && paint.getStyle() != android.graphics.Paint.Style.STROKE) {
-                                    paint.setColor(debugColor(WINDOW_BACKGROUND_COLOR));
-                                    if (pathFixLogCount.incrementAndGet() <= 30) {
-                                        XposedBridge.log("[TransparentTelegram] Canvas.drawPath: forced light paint "
-                                                + Integer.toHexString(color) + " -> " + Integer.toHexString(debugColor(WINDOW_BACKGROUND_COLOR)));
-                                    }
-                                }
-                            }
-                        });
-                XposedBridge.log("[TransparentTelegram] Canvas.drawPath universal hook installed for " + packageName);
-            } catch (Throwable t) {
-                XposedBridge.log("[TransparentTelegram] Canvas.drawPath universal hook failed for " + packageName + ": " + t);
-            }
-
-            // ПОСЛЕДНИЙ вариант: если область рисуется через уже готовый,
-            // закэшированный Bitmap (blur посчитан один раз и просто
-            // переиспользуется как картинка) -- ни один из хуков на
-            // Paint/setColor/drawRect/drawPath до этого физически не мог
-            // достать, т.к. цвет уже "запечён" в пикселях самого Bitmap,
-            // а не выставляется через Paint при каждой отрисовке.
-            // Только ДИАГНОСТИКА (не фикс) -- сэмплируем центральный пиксель
-            // и логируем стек, если он светлый.
-            try {
-                XC_MethodHook bitmapDiagHook = new XC_MethodHook() {
-                    @Override
-                    protected void beforeHookedMethod(MethodHookParam param) {
-                        if (bitmapDiagCount.get() >= 25) {
-                            return;
-                        }
-                        try {
-                            android.graphics.Bitmap bmp = (android.graphics.Bitmap) param.args[0];
-                            if (bmp == null || bmp.getWidth() == 0 || bmp.getHeight() == 0) {
-                                return;
-                            }
-                            int cx = bmp.getWidth() / 2;
-                            int cy = bmp.getHeight() / 2;
-                            int pixel = bmp.getPixel(cx, cy);
-                            if (Color.alpha(pixel) > 200 && Color.red(pixel) > 180
-                                    && Color.green(pixel) > 180 && Color.blue(pixel) > 180) {
-                                bitmapDiagCount.incrementAndGet();
-                                StringBuilder sb = new StringBuilder();
-                                sb.append("[TransparentTelegram][BITMAPDIAG] drawBitmap center pixel #")
-                                        .append(Integer.toHexString(pixel))
-                                        .append(" size=").append(bmp.getWidth()).append("x").append(bmp.getHeight())
-                                        .append(" stack:");
-                                StackTraceElement[] st = new Throwable().getStackTrace();
-                                for (int i = 0; i < Math.min(8, st.length); i++) {
-                                    sb.append("\n    at ").append(st[i].toString());
-                                }
-                                XposedBridge.log(sb.toString());
-                            }
-                        } catch (Throwable ignored) {
-                        }
-                    }
-                };
-                XposedHelpers.findAndHookMethod(android.graphics.Canvas.class, "drawBitmap",
-                        android.graphics.Bitmap.class, float.class, float.class, android.graphics.Paint.class,
-                        bitmapDiagHook);
-                XposedHelpers.findAndHookMethod(android.graphics.Canvas.class, "drawBitmap",
-                        android.graphics.Bitmap.class, android.graphics.Rect.class, android.graphics.RectF.class,
-                        android.graphics.Paint.class, bitmapDiagHook);
-                XposedBridge.log("[TransparentTelegram] Canvas.drawBitmap diag hook installed for " + packageName);
-            } catch (Throwable t) {
-                XposedBridge.log("[TransparentTelegram] Canvas.drawBitmap diag hook failed for " + packageName + ": " + t);
-            }
-
-            // drawRect ни разу не сработал ДАЖЕ для уже подтверждённо рабочих
-            // (малиновых) элементов -- значит ColorDrawable.draw() красит через
-            // Canvas.drawColor(int), а не drawRect(). Хукаем и его тоже, плюс
-            // drawPaint (заливка всей области клипа) на всякий случай.
-            try {
-                XposedHelpers.findAndHookMethod(android.graphics.Canvas.class, "drawColor", int.class,
-                        new XC_MethodHook() {
-                            @Override
-                            protected void beforeHookedMethod(MethodHookParam param) {
-                                int color = (Integer) param.args[0];
-                                if (Color.alpha(color) > 200 && Color.red(color) > 180
-                                        && Color.green(color) > 180 && Color.blue(color) > 180) {
-                                    param.args[0] = debugColor(WINDOW_BACKGROUND_COLOR);
-                                    if (canvasFixLogCount.incrementAndGet() <= 30) {
-                                        XposedBridge.log("[TransparentTelegram] Canvas.drawColor: forced light color "
-                                                + Integer.toHexString(color) + " -> " + Integer.toHexString(debugColor(WINDOW_BACKGROUND_COLOR)));
-                                    }
-                                }
-                            }
-                        });
-                XposedBridge.log("[TransparentTelegram] Canvas.drawColor universal hook installed for " + packageName);
-            } catch (Throwable t) {
-                XposedBridge.log("[TransparentTelegram] Canvas.drawColor universal hook failed for " + packageName + ": " + t);
-            }
-
-            try {
-                XposedHelpers.findAndHookMethod(android.graphics.Canvas.class, "drawPaint", android.graphics.Paint.class,
-                        new XC_MethodHook() {
-                            @Override
-                            protected void beforeHookedMethod(MethodHookParam param) {
-                                android.graphics.Paint paint = (android.graphics.Paint) param.args[0];
-                                int color = paint.getColor();
-                                if (Color.alpha(color) > 200 && Color.red(color) > 180
-                                        && Color.green(color) > 180 && Color.blue(color) > 180
-                                        && paint.getShader() == null) {
-                                    paint.setColor(debugColor(WINDOW_BACKGROUND_COLOR));
-                                    if (canvasFixLogCount.incrementAndGet() <= 30) {
-                                        XposedBridge.log("[TransparentTelegram] Canvas.drawPaint: forced light paint "
-                                                + Integer.toHexString(color) + " -> " + Integer.toHexString(debugColor(WINDOW_BACKGROUND_COLOR)));
-                                    }
-                                }
-                            }
-                        });
-                XposedBridge.log("[TransparentTelegram] Canvas.drawPaint universal hook installed for " + packageName);
-            } catch (Throwable t) {
-                XposedBridge.log("[TransparentTelegram] Canvas.drawPaint universal hook failed for " + packageName + ": " + t);
-            }
-
-            // Ещё две перегрузки drawRect (RectF и Rect вместо 4 float) --
-            // на случай если где-то используется именно они.
-            try {
-                XposedHelpers.findAndHookMethod(android.graphics.Canvas.class, "drawRect",
-                        android.graphics.RectF.class, android.graphics.Paint.class,
-                        new XC_MethodHook() {
-                            @Override
-                            protected void beforeHookedMethod(MethodHookParam param) {
-                                android.graphics.Paint paint = (android.graphics.Paint) param.args[1];
-                                int color = paint.getColor();
-                                if (Color.alpha(color) > 200 && Color.red(color) > 180
-                                        && Color.green(color) > 180 && Color.blue(color) > 180
-                                        && paint.getShader() == null) {
-                                    paint.setColor(debugColor(WINDOW_BACKGROUND_COLOR));
-                                    if (canvasFixLogCount.incrementAndGet() <= 30) {
-                                        XposedBridge.log("[TransparentTelegram] Canvas.drawRect(RectF): forced light paint "
-                                                + Integer.toHexString(color) + " -> " + Integer.toHexString(debugColor(WINDOW_BACKGROUND_COLOR)));
-                                    }
-                                }
-                            }
-                        });
-                XposedBridge.log("[TransparentTelegram] Canvas.drawRect(RectF) universal hook installed for " + packageName);
-            } catch (Throwable t) {
-                XposedBridge.log("[TransparentTelegram] Canvas.drawRect(RectF) universal hook failed for " + packageName + ": " + t);
-            }
-
-            // ============================================================
-            // ВРЕМЕННЫЙ ДИАГНОСТИЧЕСКИЙ ХУК: три попытки найти правильный
-            // высокоуровневый метод (setBackgroundColor, BlurredBackground-
-            // ColorProviderThemed.getBackgroundColor) НЕ подтвердились --
-            // хуки ставятся, но реально ни разу не вызываются для видимого
-            // баннера. Вместо дальнейшего угадывания перехватываем сам
-            // ПРИМИТИВ отрисовки -- Paint.setColor(int) -- глобально в
-            // процессе, с логом стека вызова. Кто бы ни красил этот пиксель
-            // (glass, blur, RenderNode, обычный View), он обязан в итоге
-            // вызвать это. Фильтруем по "светлый и непрозрачный" цвет, чтобы
-            // не залить лог, и ограничиваем число сработок.
-            // ============================================================
-            try {
-                XposedHelpers.findAndHookMethod(android.graphics.Paint.class, "setColor", int.class,
-                        new XC_MethodHook() {
-                            @Override
-                            protected void beforeHookedMethod(MethodHookParam param) {
-                                if (paintDiagCount.get() >= 40) {
-                                    return;
-                                }
-                                int color = (Integer) param.args[0];
-                                int a = Color.alpha(color);
-                                int r = Color.red(color);
-                                int g = Color.green(color);
-                                int b = Color.blue(color);
-                                // светлый (близко к белому/серому) и непрозрачный
-                                boolean light = a > 200 && r > 180 && g > 180 && b > 180;
-                                if (!light) {
-                                    return;
-                                }
-                                paintDiagCount.incrementAndGet();
-                                StringBuilder sb = new StringBuilder();
-                                sb.append("[TransparentTelegram][PAINTDIAG] setColor(#")
-                                        .append(Integer.toHexString(color)).append(") stack:");
-                                StackTraceElement[] st = new Throwable().getStackTrace();
-                                for (int i = 0; i < Math.min(8, st.length); i++) {
-                                    sb.append("\n    at ").append(st[i].toString());
-                                }
-                                XposedBridge.log(sb.toString());
-                            }
-                        });
-                XposedBridge.log("[TransparentTelegram] Paint.setColor diag hook installed for " + packageName);
-            } catch (Throwable t) {
-                XposedBridge.log("[TransparentTelegram] Paint.setColor diag hook failed for " + packageName + ": " + t);
-            }
 
             XposedHelpers.findAndHookMethod(launchActivityClass, "onCreate", Bundle.class,
                     new XC_MethodHook() {
@@ -611,7 +114,6 @@ public class HookEntry implements IXposedHookLoadPackage {
                         protected void beforeHookedMethod(MethodHookParam param) {
                             try {
                                 prepareWindow((Activity) param.thisObject);
-                                XposedBridge.log("[TransparentTelegram] Window prepared: " + packageName);
                             } catch (Throwable t) {
                                 XposedBridge.log("[TransparentTelegram] before onCreate failed: " + t);
                             }
@@ -631,18 +133,144 @@ public class HookEntry implements IXposedHookLoadPackage {
                     new XC_MethodHook() {
                         @Override
                         protected void afterHookedMethod(MethodHookParam param) {
-                            final Activity activity = (Activity) param.thisObject;
                             try {
-                                applyTransparency(activity);
+                                applyTransparency((Activity) param.thisObject);
                             } catch (Throwable t) {
                                 XposedBridge.log("[TransparentTelegram] onResume failed: " + t);
                             }
                         }
                     });
 
-            XposedBridge.log("[TransparentTelegram] Hooks installed for " + packageName);
+            XposedBridge.log("[TransparentTelegram] LaunchActivity hooks installed for " + packageName);
         } catch (Throwable t) {
-            XposedBridge.log("[TransparentTelegram] Failed for " + packageName + ": " + t);
+            XposedBridge.log("[TransparentTelegram] LaunchActivity hook failed for " + packageName + ": " + t);
+        }
+
+        // ---------- 2. Theme.getColor(I[ZZ)I -- главный универсальный хук ----------
+        try {
+            Class<?> themeClass = XposedHelpers.findClass(THEME_CLASS, lpparam.classLoader);
+
+            final Set<Integer> backgroundKeys = new HashSet<>();
+            final Map<Integer, String> keyNamesByValue = new HashMap<>();
+            for (String keyName : BACKGROUND_KEY_NAMES) {
+                try {
+                    int keyValue = XposedHelpers.getStaticIntField(themeClass, keyName);
+                    backgroundKeys.add(keyValue);
+                    keyNamesByValue.put(keyValue, keyName);
+                } catch (Throwable t) {
+                    XposedBridge.log("[TransparentTelegram] key " + keyName + " not found (ok, skipping): " + t);
+                }
+            }
+
+            XposedHelpers.findAndHookMethod(themeClass, "getColor",
+                    int.class, boolean[].class, boolean.class,
+                    new XC_MethodHook() {
+                        @Override
+                        protected void afterHookedMethod(MethodHookParam param) {
+                            int key = (Integer) param.args[0];
+                            if (!backgroundKeys.contains(key)) {
+                                return;
+                            }
+                            int original = (Integer) param.getResult();
+                            if (Color.alpha(original) == 255) {
+                                param.setResult(WINDOW_BACKGROUND_COLOR);
+                                if (getColorPatchLogCount.incrementAndGet() <= 40) {
+                                    XposedBridge.log("[TransparentTelegram] Theme.getColor(" + keyNamesByValue.get(key) + "): "
+                                            + Integer.toHexString(original) + " -> " + Integer.toHexString(WINDOW_BACKGROUND_COLOR));
+                                }
+                            }
+                        }
+                    });
+            XposedBridge.log("[TransparentTelegram] Theme.getColor hook installed for " + packageName
+                    + " (" + backgroundKeys.size() + " ключей)");
+        } catch (Throwable t) {
+            XposedBridge.log("[TransparentTelegram] Theme.getColor hook failed for " + packageName + ": " + t);
+        }
+
+        // ---------- 3. ActionBar.setBackgroundColor ----------
+        try {
+            Class<?> actionBarClass = XposedHelpers.findClass(
+                    "org.telegram.ui.ActionBar.ActionBar", lpparam.classLoader);
+            XposedHelpers.findAndHookMethod(actionBarClass, "setBackgroundColor", int.class,
+                    new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            int original = (Integer) param.args[0];
+                            if (Color.alpha(original) == 255) {
+                                param.args[0] = (original & 0x00FFFFFF) | (ALPHA << 24);
+                            }
+                        }
+                    });
+            XposedBridge.log("[TransparentTelegram] ActionBar.setBackgroundColor hook installed for " + packageName);
+        } catch (Throwable t) {
+            XposedBridge.log("[TransparentTelegram] ActionBar hook failed for " + packageName + ": " + t);
+        }
+
+        // ---------- 4. blur3: BlurredBackgroundSourceColor.setColor ----------
+        try {
+            Class<?> sourceColorClass = XposedHelpers.findClass(
+                    "org.telegram.ui.Components.blur3.source.BlurredBackgroundSourceColor",
+                    lpparam.classLoader);
+            XposedHelpers.findAndHookMethod(sourceColorClass, "setColor", int.class,
+                    new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            int original = (Integer) param.args[0];
+                            if (Color.alpha(original) == 255) {
+                                param.args[0] = WINDOW_BACKGROUND_COLOR;
+                            }
+                        }
+                    });
+            XposedBridge.log("[TransparentTelegram] BlurredBackgroundSourceColor hook installed for " + packageName);
+        } catch (Throwable t) {
+            XposedBridge.log("[TransparentTelegram] BlurredBackgroundSourceColor hook failed for " + packageName + ": " + t);
+        }
+
+        // ---------- 5. blur3: BlurredBackgroundColorProviderThemed (4 метода) ----------
+        try {
+            Class<?> providerClass = XposedHelpers.findClass(
+                    "org.telegram.ui.Components.blur3.drawable.color.BlurredBackgroundColorProviderThemed",
+                    lpparam.classLoader);
+            for (String methodName : new String[]{
+                    "getBackgroundColor", "getStrokeColorTop", "getStrokeColorBottom"}) {
+                try {
+                    XposedHelpers.findAndHookMethod(providerClass, methodName,
+                            new XC_MethodHook() {
+                                @Override
+                                protected void afterHookedMethod(MethodHookParam param) {
+                                    int original = (Integer) param.getResult();
+                                    if (Color.alpha(original) == 255) {
+                                        param.setResult(WINDOW_BACKGROUND_COLOR);
+                                    }
+                                }
+                            });
+                } catch (Throwable t) {
+                    XposedBridge.log("[TransparentTelegram] hook for " + methodName + " failed: " + t);
+                }
+            }
+            XposedBridge.log("[TransparentTelegram] BlurredBackgroundColorProviderThemed hook installed for " + packageName);
+        } catch (Throwable t) {
+            XposedBridge.log("[TransparentTelegram] BlurredBackgroundColorProviderThemed hook failed for " + packageName + ": " + t);
+        }
+
+        // ---------- 6. blur3: DialogsActivityTopBubblesFadeView.setColor ----------
+        try {
+            Class<?> fadeViewClass = XposedHelpers.findClass(
+                    "org.telegram.ui.Components.DialogsActivityTopBubblesFadeView",
+                    lpparam.classLoader);
+            XposedHelpers.findAndHookMethod(fadeViewClass, "setColor", int.class,
+                    new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            int original = (Integer) param.args[0];
+                            if (Color.alpha(original) == 255) {
+                                param.args[0] = WINDOW_BACKGROUND_COLOR;
+                            }
+                        }
+                    });
+            XposedBridge.log("[TransparentTelegram] DialogsActivityTopBubblesFadeView hook installed for " + packageName);
+        } catch (Throwable t) {
+            XposedBridge.log("[TransparentTelegram] DialogsActivityTopBubblesFadeView hook failed for " + packageName + ": " + t);
         }
     }
 
@@ -652,45 +280,12 @@ public class HookEntry implements IXposedHookLoadPackage {
         window.addFlags(WindowManager.LayoutParams.FLAG_SHOW_WALLPAPER);
         window.setDimAmount(0f);
         window.setBackgroundDrawable(new ColorDrawable(WINDOW_BACKGROUND_COLOR));
-        clearSystemBars(window);
     }
 
-    /**
-     * Статус-бар и навигационный бар Android рисует ОТДЕЛЬНО от DecorView
-     * (через WindowManager.LayoutParams.statusBarColor/navigationBarColor),
-     * это не View и не Drawable -- обход дерева (stripOpaqueBackgrounds)
-     * физически не может их достать. По скриншоту видно сплошную белую
-     * полосу ровно в области статус-бара -- это именно оно.
-     */
-    private void clearSystemBars(Window window) {
-        try {
-            window.setStatusBarColor(Color.TRANSPARENT);
-            window.setNavigationBarColor(Color.TRANSPARENT);
-            window.getDecorView().setSystemUiVisibility(
-                    View.SYSTEM_UI_FLAG_LAYOUT_STABLE
-                            | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
-                            | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION);
-        } catch (Throwable t) {
-            XposedBridge.log("[TransparentTelegram] clearSystemBars failed: " + t);
-        }
-    }
-
-    // Флаг на Activity: слушатель layout вешаем один раз за жизнь окна,
-    // а не при каждом applyTransparency() (иначе будут копиться дубликаты).
+    // Слушатель layout вешаем один раз за жизнь окна.
     private static final java.util.WeakHashMap<View, Boolean> LISTENER_ATTACHED = new java.util.WeakHashMap<>();
-
-    // Троттлинг: layout в Android может дёргаться десятки раз в секунду
-    // (анимации, клавиатура, скролл) -- гонять полный обход дерева на
-    // каждый чих дорого и заспамит лог. Не чаще одного раза в 400 мс.
     private static volatile long lastScanTime = 0L;
     private static final long SCAN_THROTTLE_MS = 400L;
-
-    // Диагностический дамп теперь ПОВТОРЯЕМЫЙ (не одноразовый), привязан
-    // к тому же слушателю layout, свой (более редкий) троттлинг -- чтобы
-    // при заходе на новый экран (Настройки и т.п.) в логе рано или поздно
-    // появился дамп именно оттуда, а не только с экрана при запуске.
-    private static volatile long lastDiagTime = 0L;
-    private static final long DIAG_THROTTLE_MS = 5000L;
 
     private void applyTransparency(final Activity activity) {
         if (activity == null || activity.isFinishing()) {
@@ -702,16 +297,12 @@ public class HookEntry implements IXposedHookLoadPackage {
         window.addFlags(WindowManager.LayoutParams.FLAG_SHOW_WALLPAPER);
         window.setDimAmount(0f);
         window.setBackgroundDrawable(new ColorDrawable(WINDOW_BACKGROUND_COLOR));
-        clearSystemBars(window);
 
         final View root = window.getDecorView();
         if (root == null) {
             return;
         }
 
-        // .post() -- выполнится ПОСЛЕ того, как View пройдут layout,
-        // иначе getWidth()/getHeight() ещё вернут 0 и фильтр по
-        // размеру в stripOpaqueBackgrounds отсеет всё подряд.
         root.post(new Runnable() {
             @Override
             public void run() {
@@ -719,14 +310,6 @@ public class HookEntry implements IXposedHookLoadPackage {
             }
         });
 
-        // ГЛАВНЫЙ ФИКС: Telegram -- однооконное приложение, переходы между
-        // экранами (Настройки, поиск, любой внутренний фрагмент) НЕ вызывают
-        // повторный onCreate/onResume самой Activity -- наш обход дерева
-        // просто никогда не запускался бы для этих экранов. Вешаем
-        // постоянный слушатель на изменения layout всего дерева -- он
-        // сработает при появлении/пересоздании ЛЮБОГО View, включая новые
-        // экраны, попапы, вкладки поиска и т.п. С троттлингом, чтобы не
-        // гонять полный обход на каждый мелкий layout (клавиатура, анимации).
         synchronized (LISTENER_ATTACHED) {
             if (!Boolean.TRUE.equals(LISTENER_ATTACHED.get(root))) {
                 LISTENER_ATTACHED.put(root, Boolean.TRUE);
@@ -739,17 +322,8 @@ public class HookEntry implements IXposedHookLoadPackage {
                                     lastScanTime = now;
                                     scanNow(root);
                                 }
-                                if (now - lastDiagTime >= DIAG_THROTTLE_MS) {
-                                    lastDiagTime = now;
-                                    try {
-                                        dumpDiagnostics(activity);
-                                    } catch (Throwable t) {
-                                        XposedBridge.log("[TransparentTelegram][DIAG] dump failed: " + t);
-                                    }
-                                }
                             }
                         });
-                XposedBridge.log("[TransparentTelegram] OnGlobalLayoutListener attached");
             }
         }
     }
@@ -760,60 +334,25 @@ public class HookEntry implements IXposedHookLoadPackage {
         } catch (Throwable t) {
             XposedBridge.log("[TransparentTelegram] stripOpaqueBackgrounds failed: " + t);
         }
-
-        XposedBridge.log("[TransparentTelegram] Transparency applied");
     }
 
     /**
-     * ГЛУБОКИЙ обход дерева View (в отличие от прежней версии, которая
-     * трогала только 1-2 верхних уровня). Найдено по реальным логам с
-     * устройства: настоящая "стена" -- org.telegram.ui.MainTabsActivity$2
-     * с ColorDrawable(#FF212332, alpha=255), на 8 уровней глубже
-     * DecorView, размером ровно во весь экран.
-     *
-     * Критерий отбора: непрозрачный фон (alpha==255 либо
-     * Drawable.getOpacity()==OPAQUE) И размер вида ~= размеру экрана
-     * (>=85% ширины и высоты DecorView). Это отсекает кнопки/пузыри
-     * сообщений/карточки -- у них обычно осмысленный сплошной цвет
-     * меньшего размера, трогать их не нужно (испортит читаемость чата).
-     *
-     * Через Drawable.setAlpha() (а не создание нового ColorDrawable через
-     * setBackgroundColor) -- это работает для ЛЮБого типа Drawable, включая
-     * NinePatchDrawable/BitmapDrawable (например обои чата), не только
-     * для сплошных цветов. mutate() обязателен, чтобы не задеть другие
-     * View, которые могут шарить тот же закэшированный Drawable.
+     * Подстраховка на случай, если где-то остался View с непрозрачным
+     * фоном, не пойманный через Theme.getColor()/blur3-хуки выше
+     * (например сторонний код форка, который сам создаёт ColorDrawable
+     * напрямую, а не через Theme).
      */
     private void stripOpaqueBackgrounds(View view, int rootWidth, int rootHeight, int depth) {
-        if (view == null || depth > 40) { // защита от аномально глубоких/циклических деревьев
+        if (view == null || depth > 40) {
             return;
         }
 
         Drawable bg = view.getBackground();
 
         if (bg != null && isBlurDrawable(bg)) {
-            // Отдельное правило ДО общей проверки на "во весь экран":
-            // блюр-плашки (BlurredBackgroundWithFadeDrawable и т.п.) обычно
-            // маленькие (полоска под статус-баром/шапкой) и НЕ считаются
-            // "непрозрачными" (opacity != OPAQUE) -- общий фильтр их не
-            // ловит. Раньше они блюрили обычный фон чата, теперь блюрят
-            // реальную обоину + свой fade-тон поверх -- визуально "пересвет".
-            //
-            // ВАЖНО: просто bg.setAlpha(...) на самом composite-дровейбле
-            // не помогло на практике -- судя по названию "WithFade" у него
-            // внутри отдельный слой градиента-затухания со своей фиксированной
-            // альфой/цветом, который не подчиняется внешнему Drawable.setAlpha().
-            // Поэтому ПОЛНОСТЬЮ ЗАМЕНЯЕМ фон на простой ColorDrawable -- тот
-            // же приём, что уже надёжно работает для обычных "стен" ниже.
-            // Цена: пропадает сам эффект блюра позади шапки/поиска, остаётся
-            // ровный полупрозрачный тон -- визуально это лучше, чем "пересвет".
             try {
-                view.setBackgroundColor(debugColor(WINDOW_BACKGROUND_COLOR));
-                XposedBridge.log("[TransparentTelegram] Блюр заменён на плоский тон: "
-                        + view.getClass().getName() + " (было " + bg.getClass().getName()
-                        + ", " + view.getWidth() + "x" + view.getHeight() + ")");
-            } catch (Throwable t) {
-                XposedBridge.log("[TransparentTelegram] blur patch failed on "
-                        + view.getClass().getName() + ": " + t);
+                bg.mutate().setAlpha(BLUR_ALPHA);
+            } catch (Throwable ignored) {
             }
         } else if (bg != null && isEffectivelyOpaque(bg)) {
             boolean fullWidth = view.getWidth() >= rootWidth * 0.85f;
@@ -821,26 +360,11 @@ public class HookEntry implements IXposedHookLoadPackage {
             if (fullWidth && fullHeight) {
                 try {
                     if (bg instanceof ColorDrawable) {
-                        // ЗАМЕНЯЕМ цвет целиком на единый фиксированный тон
-                        // (как в оригинальном патче: android:windowBackground
-                        // жёстко заменили на #80000000, а не просто снизили
-                        // альфу исходному белому/светлому цвету). Если вместо
-                        // этого просто снижать альфу СВЕТЛОМУ фону (список
-                        // чатов в светлой теме и т.п.) -- получается "пересвеченное"
-                        // мутно-белое стекло поверх обоины, а не аккуратный
-                        // тёмный тон, как в чате.
-                        view.setBackgroundColor(debugColor(WINDOW_BACKGROUND_COLOR));
+                        view.setBackgroundColor(WINDOW_BACKGROUND_COLOR);
                     } else {
-                        // Для НЕ-сплошного фона (обои чата, паттерны, битмапы) --
-                        // заменить целиком нельзя, там важна сама картинка, поэтому
-                        // просто снижаем альфу как раньше.
                         bg.mutate().setAlpha(ALPHA);
                     }
-                    XposedBridge.log("[TransparentTelegram] Стена найдена и пробита: "
-                            + view.getClass().getName() + " (" + view.getWidth() + "x" + view.getHeight() + ")");
-                } catch (Throwable t) {
-                    XposedBridge.log("[TransparentTelegram] patch failed on "
-                            + view.getClass().getName() + ": " + t);
+                } catch (Throwable ignored) {
                 }
             }
         }
@@ -861,105 +385,8 @@ public class HookEntry implements IXposedHookLoadPackage {
         return d.getOpacity() == PixelFormat.OPAQUE;
     }
 
-    /**
-     * Ловим блюр-дровейблы по имени класса, а не по opacity/размеру --
-     * они сами по себе полупрозрачные по задумке (opacity != OPAQUE),
-     * поэтому общий фильтр их пропускает, но визуально именно они дают
-     * "пересвеченный блюр" поверх живой обоины.
-     */
     private boolean isBlurDrawable(Drawable d) {
         String name = d.getClass().getName().toLowerCase();
         return name.contains("blur");
-    }
-
-    // ==================== ДИАГНОСТИКА ====================
-
-    private void dumpDiagnostics(Activity activity) {
-        if (activity == null || activity.isFinishing()) {
-            XposedBridge.log("[TransparentTelegram][DIAG] activity is null/finishing, skip");
-            return;
-        }
-
-        Window window = activity.getWindow();
-        WindowManager.LayoutParams attrs = window.getAttributes();
-
-        XposedBridge.log("[TransparentTelegram][DIAG] ===== DUMP START =====");
-        XposedBridge.log("[TransparentTelegram][DIAG] activity=" + activity.getClass().getName());
-        XposedBridge.log("[TransparentTelegram][DIAG] window.flags=0x" + Integer.toHexString(attrs.flags)
-                + " (FLAG_SHOW_WALLPAPER set=" + ((attrs.flags & WindowManager.LayoutParams.FLAG_SHOW_WALLPAPER) != 0) + ")");
-        XposedBridge.log("[TransparentTelegram][DIAG] window.dimAmount=" + attrs.dimAmount);
-        XposedBridge.log("[TransparentTelegram][DIAG] window.alpha=" + attrs.alpha);
-
-        View decor = window.getDecorView();
-        XposedBridge.log("[TransparentTelegram][DIAG] decorView background=" + describeDrawable(decor.getBackground()));
-        XposedBridge.log("[TransparentTelegram][DIAG] decorView alpha=" + decor.getAlpha()
-                + " visibility=" + decor.getVisibility());
-
-        dumpViewTree(decor, 0);
-
-        XposedBridge.log("[TransparentTelegram][DIAG] ===== DUMP END =====");
-    }
-
-    private final int[] locBuf = new int[2];
-
-    private void dumpViewTree(View view, int depth) {
-        if (view == null || depth > MAX_DEPTH) {
-            return;
-        }
-
-        StringBuilder indent = new StringBuilder();
-        for (int i = 0; i < depth; i++) {
-            indent.append("  ");
-        }
-
-        int screenX = -1;
-        int screenY = -1;
-        try {
-            view.getLocationOnScreen(locBuf);
-            screenX = locBuf[0];
-            screenY = locBuf[1];
-        } catch (Throwable ignored) {
-        }
-
-        String line = indent + "[" + depth + "] " + view.getClass().getName()
-                + " bg=" + describeDrawable(view.getBackground())
-                + " alpha=" + view.getAlpha()
-                + " vis=" + visibilityToString(view.getVisibility())
-                + " size=" + view.getWidth() + "x" + view.getHeight()
-                + " pos=(" + screenX + "," + screenY + ")-(" + (screenX + view.getWidth())
-                + "," + (screenY + view.getHeight()) + ")";
-        XposedBridge.log("[TransparentTelegram][DIAG] " + line);
-
-        if (view instanceof ViewGroup) {
-            ViewGroup group = (ViewGroup) view;
-            int count = Math.min(group.getChildCount(), MAX_CHILDREN);
-            for (int i = 0; i < count; i++) {
-                dumpViewTree(group.getChildAt(i), depth + 1);
-            }
-            if (group.getChildCount() > MAX_CHILDREN) {
-                XposedBridge.log("[TransparentTelegram][DIAG] " + indent + "  ... ещё "
-                        + (group.getChildCount() - MAX_CHILDREN) + " детей не показано");
-            }
-        }
-    }
-
-    private String describeDrawable(Drawable d) {
-        if (d == null) {
-            return "null";
-        }
-        if (d instanceof ColorDrawable) {
-            int color = ((ColorDrawable) d).getColor();
-            return String.format("ColorDrawable(#%08X, alpha=%d)", color, Color.alpha(color));
-        }
-        return d.getClass().getName() + " (opacity=" + d.getOpacity() + ", alpha=" + d.getAlpha() + ")";
-    }
-
-    private String visibilityToString(int v) {
-        switch (v) {
-            case View.VISIBLE: return "VISIBLE";
-            case View.INVISIBLE: return "INVISIBLE";
-            case View.GONE: return "GONE";
-            default: return String.valueOf(v);
-        }
     }
 }
