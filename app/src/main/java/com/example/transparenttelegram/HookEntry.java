@@ -41,6 +41,9 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
  *    первом вызове getColor().
  * 4. Тёмный текст на прозрачном фоне не читается -- инвертируем
  *    текстовые ключи на светлый цвет (только если исходный тёмный).
+ * 5. Карточки-секции в настройках рисуют фон НЕ через Theme.getColor,
+ *    а напрямую через View.setBackground / setBackgroundColor --
+ *    ловим их отдельными хуками.
  */
 public class HookEntry implements IXposedHookLoadPackage {
 
@@ -72,8 +75,6 @@ public class HookEntry implements IXposedHookLoadPackage {
     };
 
     // Текстовые ключи -- инвертируем тёмный текст на светлый.
-    // ВАЖНО: key_windowBackgroundWhiteBlackText НЕ должен быть в
-    // BACKGROUND_KEY_NAMES, иначе фон и текст дерутся за один ключ.
     private static final String[] TEXT_KEY_NAMES = {
             "key_windowBackgroundWhiteBlackText",
             "key_windowBackgroundWhiteGrayText",
@@ -277,6 +278,54 @@ public class HookEntry implements IXposedHookLoadPackage {
             XposedBridge.log("[TransparentTelegram] Theme.getColor hook installed for " + packageName);
         } catch (Throwable t) {
             XposedBridge.log("[TransparentTelegram] Theme.getColor hook failed for " + packageName + ": " + t);
+        }
+
+        // ---------- 2b. View.setBackgroundColor / setBackground ----------
+        // Ловит карточки-секции в настройках и другие View, которым фон
+        // ставится напрямую, минуя Theme.getColor.
+        try {
+            XposedHelpers.findAndHookMethod(View.class, "setBackgroundColor", int.class,
+                    new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            try {
+                                int color = (Integer) param.args[0];
+                                if (Color.alpha(color) == 255) {
+                                    param.args[0] = (color & 0x00FFFFFF) | (ALPHA << 24);
+                                }
+                            } catch (Throwable ignored) {
+                            }
+                        }
+                    });
+
+            XposedHelpers.findAndHookMethod(View.class, "setBackground", Drawable.class,
+                    new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            try {
+                                Drawable d = (Drawable) param.args[0];
+                                if (d == null) return;
+
+                                if (d instanceof ColorDrawable) {
+                                    int c = ((ColorDrawable) d).getColor();
+                                    if (Color.alpha(c) == 255) {
+                                        param.args[0] = new ColorDrawable(
+                                                (c & 0x00FFFFFF) | (ALPHA << 24));
+                                    }
+                                    return;
+                                }
+
+                                if (d.getOpacity() == PixelFormat.OPAQUE) {
+                                    d.mutate().setAlpha(ALPHA);
+                                }
+                            } catch (Throwable ignored) {
+                            }
+                        }
+                    });
+
+            XposedBridge.log("[TransparentTelegram] View background hooks installed for " + packageName);
+        } catch (Throwable t) {
+            XposedBridge.log("[TransparentTelegram] View background hooks failed for " + packageName + ": " + t);
         }
 
         // ---------- 3. ActionBar.setBackgroundColor ----------
