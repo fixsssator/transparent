@@ -24,41 +24,6 @@ import de.robv.android.xposed.XposedBridge;
 import de.robv.android.xposed.XposedHelpers;
 import de.robv.android.xposed.callbacks.XC_LoadPackage;
 
-/**
- * Transparent Telegram — универсальный LSPosed-модуль.
- *
- * История находок (коротко, для будущего себя/других):
- * 1. Оригинальный "авторский" патч APK менял ТРИ вещи:
- *    a) res/values/styles.xml и все values-vNN styles.xml (квалифаеры версий!) --
- *       windowShowWallpaper=true + полупрозрачный windowBackground/colorBackground.
- *       Это НЕОБХОДИМО, но на Android 15+ (edge-to-edge) само по себе
- *       НЕДОСТАТОЧНО -- окно всё равно не становится по-настоящему
- *       прозрачным без явного рантайм-вызова Window.setFormat(TRANSLUCENT).
- *    b) org/telegram/ui/ActionBar/ThemeColors.createDefaultColors() --
- *       хардкод ДЕФОЛТНЫХ цветов темы (key_windowBackgroundWhite,
- *       key_windowBackgroundGray, key_windowBackgroundUnchecked,
- *       key_actionBarDefault и т.д.) на #80000000. Это и есть настоящий
- *       фундаментальный источник "белых стен" -- НЕ blur3/glass-система,
- *       которую мы долго и безуспешно пытались пробить отдельными хуками.
- *    c) Theme$ThemeInfo.getPreviewBackgroundColor() и
- *       ChatActivity$ThemeDelegate.getBackgroundDrawableFromTheme() --
- *       более мелкие, но тоже реальные точки с тем же цветом.
- *
- * 2. Вместо того чтобы хукать createDefaultColors() (создаётся один раз
- *    при старте, дальше активная тема может брать цвета из СВОЕГО набора,
- *    а не из дефолтного массива) -- хукаем Theme.getColor(I[ZZ)I,
- *    универсальную точку, через которую ЛЮБОЙ код приложения запрашивает
- *    цвет темы по ключу, независимо от того, дефолтная тема сейчас
- *    активна или пользовательская. Для конкретного списка "фоновых"
- *    ключей подменяем результат на наш цвет.
- *
- * 3. Специфичные для blur3/glass-рендеринга хуки (ActionBar.setBackgroundColor,
- *    BlurredBackgroundSourceColor.setColor, BlurredBackgroundColorProviderThemed,
- *    DialogsActivityTopBubblesFadeView.setColor) оставлены как
- *    дополнительная подстраховка для конкретных decorative-элементов
- *    (блюр под шапкой/вкладками), которые НЕ читают цвет через
- *    Theme.getColor() напрямую, а держат свой собственный Paint.
- */
 public class HookEntry implements IXposedHookLoadPackage {
 
     private static final Set<String> TARGET_PACKAGES = new HashSet<>(Arrays.asList(
@@ -78,21 +43,60 @@ public class HookEntry implements IXposedHookLoadPackage {
     private static final int WINDOW_BACKGROUND_COLOR = Color.argb(ALPHA, 0, 0, 0);
     private static final int BLUR_ALPHA = 0x40;
 
-    // Ключи Theme.key_* (статические int-поля), значения которых считаем
-    // "фоновой стеной" и подменяем безусловно. Имена читаем через
-    // рефлексию в handleLoadPackage -- если какого-то ключа нет в
-    // конкретной версии/форке, просто пропускаем его без падения.
     private static final String[] BACKGROUND_KEY_NAMES = {
             "key_windowBackgroundWhite",
             "key_windowBackgroundGray",
             "key_windowBackgroundUnchecked",
             "key_actionBarDefault",
             "key_actionBarDefaultArchived",
-            "key_windowBackgroundWhiteBlackText", // на случай текстовых контейнеров с тем же фоном
+            "key_windowBackgroundWhiteBlackText",
     };
 
+    // --- Ленивое разрешение ключей Theme.key_* ---
+    // ВАЖНО: нельзя читать эти статические поля в handleLoadPackage --
+    // это триггерит <clinit> класса Theme до готовности Context и
+    // НАВСЕГДА ломает класс для всего процесса (NoClassDefFoundError).
+    // Читаем при первом реальном вызове getColor(), когда Theme уже
+    // инициализирован самим Telegram.
+    private static volatile Set<Integer> backgroundKeys = null;
+    private static volatile Map<Integer, String> keyNamesByValue = null;
+    private static final Object KEYS_LOCK = new Object();
+    private static volatile boolean keysResolveFailed = false;
+
     private static final AtomicInteger getColorPatchLogCount = new AtomicInteger(0);
-    private static final AtomicInteger drawFixLogCount = new AtomicInteger(0);
+
+    private static void resolveBackgroundKeys(ClassLoader cl) {
+        if (backgroundKeys != null || keysResolveFailed) {
+            return;
+        }
+        synchronized (KEYS_LOCK) {
+            if (backgroundKeys != null || keysResolveFailed) {
+                return;
+            }
+            try {
+                Class<?> themeClass = XposedHelpers.findClass(THEME_CLASS, cl);
+                Set<Integer> keys = new HashSet<>();
+                Map<Integer, String> names = new HashMap<>();
+                for (String keyName : BACKGROUND_KEY_NAMES) {
+                    try {
+                        int keyValue = XposedHelpers.getStaticIntField(themeClass, keyName);
+                        keys.add(keyValue);
+                        names.put(keyValue, keyName);
+                    } catch (Throwable t) {
+                        XposedBridge.log("[TransparentTelegram] key " + keyName
+                                + " not found (ok, skipping): " + t);
+                    }
+                }
+                keyNamesByValue = names;
+                backgroundKeys = keys;
+                XposedBridge.log("[TransparentTelegram] resolved " + keys.size()
+                        + " background keys lazily");
+            } catch (Throwable t) {
+                keysResolveFailed = true;
+                XposedBridge.log("[TransparentTelegram] resolveBackgroundKeys failed: " + t);
+            }
+        }
+    }
 
     @Override
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) {
@@ -101,12 +105,13 @@ public class HookEntry implements IXposedHookLoadPackage {
         }
 
         final String packageName = lpparam.packageName;
+        final ClassLoader cl = lpparam.classLoader;
         XposedBridge.log("[TransparentTelegram] Loading: " + packageName);
 
         // ---------- 1. Окно: LaunchActivity.onCreate / onResume ----------
         try {
             Class<?> launchActivityClass = XposedHelpers.findClass(
-                    LAUNCH_ACTIVITY_CLASS, lpparam.classLoader);
+                    LAUNCH_ACTIVITY_CLASS, cl);
 
             XposedHelpers.findAndHookMethod(launchActivityClass, "onCreate", Bundle.class,
                     new XC_MethodHook() {
@@ -148,25 +153,19 @@ public class HookEntry implements IXposedHookLoadPackage {
 
         // ---------- 2. Theme.getColor(I[ZZ)I -- главный универсальный хук ----------
         try {
-            Class<?> themeClass = XposedHelpers.findClass(THEME_CLASS, lpparam.classLoader);
-
-            final Set<Integer> backgroundKeys = new HashSet<>();
-            final Map<Integer, String> keyNamesByValue = new HashMap<>();
-            for (String keyName : BACKGROUND_KEY_NAMES) {
-                try {
-                    int keyValue = XposedHelpers.getStaticIntField(themeClass, keyName);
-                    backgroundKeys.add(keyValue);
-                    keyNamesByValue.put(keyValue, keyName);
-                } catch (Throwable t) {
-                    XposedBridge.log("[TransparentTelegram] key " + keyName + " not found (ok, skipping): " + t);
-                }
-            }
+            Class<?> themeClass = XposedHelpers.findClass(THEME_CLASS, cl);
 
             XposedHelpers.findAndHookMethod(themeClass, "getColor",
                     int.class, boolean[].class, boolean.class,
                     new XC_MethodHook() {
                         @Override
                         protected void afterHookedMethod(MethodHookParam param) {
+                            // Лениво разрешаем ключи при первом вызове,
+                            // когда Theme уже полностью инициализирован.
+                            resolveBackgroundKeys(cl);
+                            if (backgroundKeys == null) {
+                                return;
+                            }
                             int key = (Integer) param.args[0];
                             if (!backgroundKeys.contains(key)) {
                                 return;
@@ -175,14 +174,15 @@ public class HookEntry implements IXposedHookLoadPackage {
                             if (Color.alpha(original) == 255) {
                                 param.setResult(WINDOW_BACKGROUND_COLOR);
                                 if (getColorPatchLogCount.incrementAndGet() <= 40) {
-                                    XposedBridge.log("[TransparentTelegram] Theme.getColor(" + keyNamesByValue.get(key) + "): "
-                                            + Integer.toHexString(original) + " -> " + Integer.toHexString(WINDOW_BACKGROUND_COLOR));
+                                    XposedBridge.log("[TransparentTelegram] Theme.getColor("
+                                            + keyNamesByValue.get(key) + "): "
+                                            + Integer.toHexString(original) + " -> "
+                                            + Integer.toHexString(WINDOW_BACKGROUND_COLOR));
                                 }
                             }
                         }
                     });
-            XposedBridge.log("[TransparentTelegram] Theme.getColor hook installed for " + packageName
-                    + " (" + backgroundKeys.size() + " ключей)");
+            XposedBridge.log("[TransparentTelegram] Theme.getColor hook installed for " + packageName);
         } catch (Throwable t) {
             XposedBridge.log("[TransparentTelegram] Theme.getColor hook failed for " + packageName + ": " + t);
         }
@@ -190,7 +190,7 @@ public class HookEntry implements IXposedHookLoadPackage {
         // ---------- 3. ActionBar.setBackgroundColor ----------
         try {
             Class<?> actionBarClass = XposedHelpers.findClass(
-                    "org.telegram.ui.ActionBar.ActionBar", lpparam.classLoader);
+                    "org.telegram.ui.ActionBar.ActionBar", cl);
             XposedHelpers.findAndHookMethod(actionBarClass, "setBackgroundColor", int.class,
                     new XC_MethodHook() {
                         @Override
@@ -210,7 +210,7 @@ public class HookEntry implements IXposedHookLoadPackage {
         try {
             Class<?> sourceColorClass = XposedHelpers.findClass(
                     "org.telegram.ui.Components.blur3.source.BlurredBackgroundSourceColor",
-                    lpparam.classLoader);
+                    cl);
             XposedHelpers.findAndHookMethod(sourceColorClass, "setColor", int.class,
                     new XC_MethodHook() {
                         @Override
@@ -226,11 +226,11 @@ public class HookEntry implements IXposedHookLoadPackage {
             XposedBridge.log("[TransparentTelegram] BlurredBackgroundSourceColor hook failed for " + packageName + ": " + t);
         }
 
-        // ---------- 5. blur3: BlurredBackgroundColorProviderThemed (4 метода) ----------
+        // ---------- 5. blur3: BlurredBackgroundColorProviderThemed ----------
         try {
             Class<?> providerClass = XposedHelpers.findClass(
                     "org.telegram.ui.Components.blur3.drawable.color.BlurredBackgroundColorProviderThemed",
-                    lpparam.classLoader);
+                    cl);
             for (String methodName : new String[]{
                     "getBackgroundColor", "getStrokeColorTop", "getStrokeColorBottom"}) {
                 try {
@@ -257,7 +257,7 @@ public class HookEntry implements IXposedHookLoadPackage {
         try {
             Class<?> fadeViewClass = XposedHelpers.findClass(
                     "org.telegram.ui.Components.DialogsActivityTopBubblesFadeView",
-                    lpparam.classLoader);
+                    cl);
             XposedHelpers.findAndHookMethod(fadeViewClass, "setColor", int.class,
                     new XC_MethodHook() {
                         @Override
@@ -282,7 +282,6 @@ public class HookEntry implements IXposedHookLoadPackage {
         window.setBackgroundDrawable(new ColorDrawable(WINDOW_BACKGROUND_COLOR));
     }
 
-    // Слушатель layout вешаем один раз за жизнь окна.
     private static final java.util.WeakHashMap<View, Boolean> LISTENER_ATTACHED = new java.util.WeakHashMap<>();
     private static volatile long lastScanTime = 0L;
     private static final long SCAN_THROTTLE_MS = 400L;
@@ -336,12 +335,6 @@ public class HookEntry implements IXposedHookLoadPackage {
         }
     }
 
-    /**
-     * Подстраховка на случай, если где-то остался View с непрозрачным
-     * фоном, не пойманный через Theme.getColor()/blur3-хуки выше
-     * (например сторонний код форка, который сам создаёт ColorDrawable
-     * напрямую, а не через Theme).
-     */
     private void stripOpaqueBackgrounds(View view, int rootWidth, int rootHeight, int depth) {
         if (view == null || depth > 40) {
             return;
