@@ -78,6 +78,11 @@ public class HookEntry implements IXposedHookLoadPackage {
         final String packageName = lpparam.packageName;
         XposedBridge.log("[TransparentTelegram] Loading: " + packageName);
 
+        // Telegram 12.10.x stores the default theme colors in an obfuscated
+        // static color table. The class name changed between 12.10.3 and
+        // 12.10.4 Beta, but the relevant API remained the same.
+        hookTelegramColors(lpparam.classLoader);
+
         try {
             Class<?> launchActivityClass = XposedHelpers.findClass(
                     LAUNCH_ACTIVITY_CLASS, lpparam.classLoader);
@@ -247,6 +252,80 @@ public class HookEntry implements IXposedHookLoadPackage {
             return Color.alpha(((ColorDrawable) d).getColor()) == 255;
         }
         return d.getOpacity() == PixelFormat.OPAQUE;
+    }
+
+    // ==================== TELEGRAM THEME COLORS ====================
+
+    private void hookTelegramColors(ClassLoader classLoader) {
+        hookThemeClass(classLoader, "org.telegram.ui.ActionBar.l5", "12.10.3");
+        hookThemeClass(classLoader, "org.telegram.ui.ActionBar.g5", "12.10.4");
+    }
+
+    private void hookThemeClass(ClassLoader classLoader, String className, String version) {
+        try {
+            final Class<?> themeClass = XposedHelpers.findClassIfExists(className, classLoader);
+            if (themeClass == null) {
+                return;
+            }
+
+            XposedHelpers.findAndHookMethod(themeClass, "e",
+                    new XC_MethodHook() {
+                        @Override
+                        protected void afterHookedMethod(MethodHookParam param) {
+                            try {
+                                if (!(param.getResult() instanceof int[])) {
+                                    XposedBridge.log("[TransparentTelegram][THEME] "
+                                            + version + " e() returned "
+                                            + (param.getResult() == null
+                                            ? "null"
+                                            : param.getResult().getClass().getName()));
+                                    return;
+                                }
+
+                                int[] colors = (int[]) param.getResult();
+                                patchThemeColor(themeClass, colors, "actionBarDefault");
+                                patchThemeColor(themeClass, colors, "windowBackgroundWhite");
+                                patchThemeColor(themeClass, colors, "windowBackgroundGray");
+                            } catch (Throwable t) {
+                                XposedBridge.log("[TransparentTelegram][THEME] "
+                                        + version + " patch failed: " + t);
+                            }
+                        }
+                    });
+
+            XposedBridge.log("[TransparentTelegram][THEME] Hook installed: "
+                    + version + " -> " + className);
+        } catch (Throwable t) {
+            XposedBridge.log("[TransparentTelegram][THEME] "
+                    + version + " hook failed for " + className + ": " + t);
+        }
+    }
+
+    private void patchThemeColor(Class<?> themeClass, int[] colors, String key) {
+        try {
+            Object result = XposedHelpers.callStaticMethod(themeClass, "s", key);
+            if (!(result instanceof Integer)) {
+                return;
+            }
+
+            int index = (Integer) result;
+            if (index < 0 || index >= colors.length) {
+                XposedBridge.log("[TransparentTelegram][THEME] "
+                        + key + " invalid index=" + index + " size=" + colors.length);
+                return;
+            }
+
+            int oldColor = colors[index];
+            colors[index] = WINDOW_BACKGROUND_COLOR;
+
+            XposedBridge.log("[TransparentTelegram][THEME] "
+                    + key + " index=" + index
+                    + " old=#" + String.format("%08X", oldColor)
+                    + " new=#" + String.format("%08X", WINDOW_BACKGROUND_COLOR));
+        } catch (Throwable t) {
+            XposedBridge.log("[TransparentTelegram][THEME] "
+                    + key + " lookup failed: " + t);
+        }
     }
 
     // ==================== ДИАГНОСТИКА ====================
