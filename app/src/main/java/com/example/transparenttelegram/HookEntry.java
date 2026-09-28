@@ -86,7 +86,11 @@ public class HookEntry implements IXposedHookLoadPackage {
     private static final String SIZE_NOTIFIER_NAME = "org.telegram.ui.Components.SizeNotifierFrameLayout";
     private static final String SKIP_BG_METHOD = "setSkipBackgroundDrawing";
 
-    private static final int ALPHA = 0x80;
+    /**
+     * Общее затемнение: чёрный с этой альфой кладётся на окно и все "залитые" фоны.
+     * Было 0x80 (50%) -- отсюда общая темнота. 0x00 = без затемнения, 0xFF = сплошной чёрный.
+     */
+    private static final int ALPHA = 0x60;
     private static final int WINDOW_BACKGROUND_COLOR = Color.argb(ALPHA, 0, 0, 0);
     private static final int BLUR_ALPHA = 0x40;
     private static final int TEXT_COLOR_LIGHT = Color.argb(0xFF, 0xEE, 0xEE, 0xEE);
@@ -95,7 +99,7 @@ public class HookEntry implements IXposedHookLoadPackage {
      * Максимальная альфа для "панельных" ключей (закреп, верхние панели чата).
      * 0x00 -- полностью прозрачно, 0xFF -- как было. Если баннер всё ещё тёмный, уменьшайте.
      */
-    private static final int PANEL_ALPHA = 0x50;
+    private static final int PANEL_ALPHA = 0x28;
 
     /** Минимум static int-полей у класса Theme (в реальности ~850). */
     private static final int THEME_MIN_STATIC_INTS = 200;
@@ -105,8 +109,6 @@ public class HookEntry implements IXposedHookLoadPackage {
             "windowBackgroundWhite",
             "windowBackgroundGray",
             "windowBackgroundUnchecked",
-            "actionBarDefault",
-            "actionBarDefaultArchived",
             "chat_wallpaper",
     };
     private static final String[] TEXT_NAMES = {
@@ -122,6 +124,9 @@ public class HookEntry implements IXposedHookLoadPackage {
      */
     private static final String[] PANEL_NAMES = {
             "chat_topPanelBackground",
+            "actionBarDefault",
+            "actionBarDefaultArchived",
+            "glass_targetMainTopPanel",
     };
     private static final String KEY_MARKER = "windowBackgroundWhite";
 
