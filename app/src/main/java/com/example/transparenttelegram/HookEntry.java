@@ -38,29 +38,35 @@ import de.robv.android.xposed.XposedHelpers;
 import de.robv.android.xposed.callbacks.XC_LoadPackage;
 
 /**
- * Transparent Telegram v4 -- универсальная версия (без привязки к именам R8).
+ * Transparent Telegram v5 -- универсальная версия (без привязки к именам R8).
  *
- * Ничего обфусцированного не захардкожено. Всё находится структурно:
+ * Что нового по сравнению с v4 (проверено разбором dex беты 12.10.6):
  *
- *  1. Класс Theme -- это класс пакета org.telegram.ui.ActionBar с максимальным
- *     числом static int-полей (в 12.10.5: p6, 849 полей; у следующего класса -- 1).
- *  2. Корневой getColor -- static int-метод Theme, у которого есть параметр boolean[]
- *     (в 12.10.3 это w0([ZIZ)I, в старых -- getColor(I[ZZ)I). Позиция int-ключа
- *     определяется по сигнатуре. Обёртки (I)I вызывают корневой метод, отдельно
- *     их хукать не нужно. Если метода с boolean[] нет -- запасной вариант:
- *     все static int-методы с ровно одним int-параметром.
- *  3. Карта "ключ темы -> строковое имя" -- static метод без аргументов, который
- *     возвращает SparseArray и среди значений содержит "windowBackgroundWhite"
- *     (в 12.10.5: m5.d()). Строки не обфусцируются, поэтому карта надёжна.
- *     Вызывается лениво, из уже сработавшего хука (Theme к этому моменту готов).
+ *  A. Цвета через провайдер ресурсов.
+ *     В бете почти все цвета UI берутся через static-метод Theme (i6.v0) с сигнатурой (int, ResourceProvider).
+ *     Если провайдер не null (а в чате он всегда не null), метод вызывает provider.G0(key)
+ *     и НЕ заходит в корневой getColor(boolean[], int, boolean). Поэтому в чате хук на корневой метод
+ *     не срабатывал: стеклянные панели (шапка, закреп) оставались тёмными и почти непрозрачными.
+ *     Теперь хукается и этот вариант: static int-метод Theme с параметрами (int, <interface>).
  *
- * Класс LaunchActivity R8 не переименовывает (проверено на 12.10.5), поэтому
- * оконные хуки остались как были. Остальные хуки -- на View/Canvas, они не
- * зависят от имён Telegram вообще.
+ *  B. Фон чата.
+ *     Обои чата рисует вложенный View внутри SizeNotifierFrameLayout (в 12.10.6 -- cw0),
+ *     и только пока флаг skipBackgroundDrawing == false (проверено по байткоду: при true onDraw
+ *     пропускает весь блок отрисовки обоев). Класс ищется структурно: класс пакета
+ *     org.telegram.ui.Components, у которого есть метод setSkipBackgroundDrawing(boolean)
+ *     (имя метода R8 не переименовывает). На нём: аргумент принудительно true, плюс true
+ *     ставится при onAttachedToWindow.
  *
- * Что сломает модуль: смена пакета org.telegram.ui.ActionBar, переименование
- * LaunchActivity, изменение строк ключей или ушедшая карта SparseArray. Всё это
- * видно в логе Xposed по префиксу [TT].
+ *  C. Прозрачность панелей отдельно.
+ *     Для ключей из PANEL_NAMES альфа принудительно опускается до PANEL_ALPHA
+ *     (чем меньше, тем прозрачнее). Крутите константу под вкус.
+ *
+ * Остальное как в v4: Theme = класс org.telegram.ui.ActionBar с максимумом static int-полей,
+ * карта "ключ -> имя" -- static SparseArray-метод без аргументов со строкой "windowBackgroundWhite".
+ *
+ * Что сломает модуль: смена пакетов org.telegram.ui.ActionBar / org.telegram.ui.Components,
+ * переименование LaunchActivity, изменение строк ключей темы или имени setSkipBackgroundDrawing.
+ * Всё это видно в логе Xposed по префиксу [TT].
  */
 public class HookEntry implements IXposedHookLoadPackage {
 
@@ -76,11 +82,20 @@ public class HookEntry implements IXposedHookLoadPackage {
 
     private static final String LAUNCH_ACTIVITY_CLASS = "org.telegram.ui.LaunchActivity";
     private static final String ACTIONBAR_PKG = "org.telegram.ui.ActionBar.";
+    private static final String COMPONENTS_PKG = "org.telegram.ui.Components.";
+    private static final String SIZE_NOTIFIER_NAME = "org.telegram.ui.Components.SizeNotifierFrameLayout";
+    private static final String SKIP_BG_METHOD = "setSkipBackgroundDrawing";
 
     private static final int ALPHA = 0x80;
     private static final int WINDOW_BACKGROUND_COLOR = Color.argb(ALPHA, 0, 0, 0);
     private static final int BLUR_ALPHA = 0x40;
     private static final int TEXT_COLOR_LIGHT = Color.argb(0xFF, 0xEE, 0xEE, 0xEE);
+
+    /**
+     * Максимальная альфа для "панельных" ключей (закреп, верхние панели чата).
+     * 0x00 -- полностью прозрачно, 0xFF -- как было. Если баннер всё ещё тёмный, уменьшайте.
+     */
+    private static final int PANEL_ALPHA = 0x50;
 
     /** Минимум static int-полей у класса Theme (в реальности ~850). */
     private static final int THEME_MIN_STATIC_INTS = 200;
@@ -92,6 +107,7 @@ public class HookEntry implements IXposedHookLoadPackage {
             "windowBackgroundUnchecked",
             "actionBarDefault",
             "actionBarDefaultArchived",
+            "chat_wallpaper",
     };
     private static final String[] TEXT_NAMES = {
             "windowBackgroundWhiteBlackText",
@@ -99,12 +115,21 @@ public class HookEntry implements IXposedHookLoadPackage {
             "actionBarDefaultTitle",
             "actionBarDefaultIcon",
     };
+    /**
+     * Панели: альфа ограничивается сверху PANEL_ALPHA, цвет сохраняется.
+     * Если шапка чата (кнопки назад/звонок/заголовок) всё ещё тёмная, добавьте сюда
+     * "glass_targetMainTopPanel" -- но он же влияет на верхнюю панель списка чатов.
+     */
+    private static final String[] PANEL_NAMES = {
+            "chat_topPanelBackground",
+    };
     private static final String KEY_MARKER = "windowBackgroundWhite";
 
     private static volatile List<Class<?>> uiClasses = null;
 
     private static volatile Set<Integer> backgroundKeys = null;
     private static volatile Set<Integer> textKeys = null;
+    private static volatile Set<Integer> panelKeys = null;
     private static volatile Map<Integer, String> keyNamesByValue = null;
     private static final Object KEYS_LOCK = new Object();
     private static volatile boolean keysResolveFailed = false;
@@ -116,8 +141,8 @@ public class HookEntry implements IXposedHookLoadPackage {
     // Структурный поиск
     // =====================================================================
 
-    /** Классы пакета org.telegram.ui.ActionBar (без вложенных), БЕЗ запуска <clinit>. */
-    private static List<Class<?>> listActionBarClasses(ClassLoader cl) {
+    /** Верхнеуровневые классы пакета (без вложенных), БЕЗ запуска <clinit>. */
+    private static List<Class<?>> listClasses(ClassLoader cl, String prefix) {
         List<Class<?>> out = new ArrayList<>();
         try {
             Object pathList = XposedHelpers.getObjectField(cl, "pathList");
@@ -128,7 +153,7 @@ public class HookEntry implements IXposedHookLoadPackage {
                 Enumeration<String> en = ((DexFile) df).entries();
                 while (en.hasMoreElements()) {
                     String name = en.nextElement();
-                    if (!name.startsWith(ACTIONBAR_PKG) || name.indexOf('$') >= 0) continue;
+                    if (!name.startsWith(prefix) || name.indexOf('$') >= 0) continue;
                     try {
                         // initialize=false: не форсируем <clinit>, иначе Theme упадёт раньше времени
                         out.add(Class.forName(name, false, cl));
@@ -137,7 +162,7 @@ public class HookEntry implements IXposedHookLoadPackage {
                 }
             }
         } catch (Throwable t) {
-            XposedBridge.log("[TT] listActionBarClasses failed: " + t);
+            XposedBridge.log("[TT] listClasses(" + prefix + ") failed: " + t);
         }
         return out;
     }
@@ -180,9 +205,16 @@ public class HookEntry implements IXposedHookLoadPackage {
         return true;
     }
 
-    /** Корневой getColor: static int-метод с boolean[] и int. Запасной вариант -- (I)I. */
+    /**
+     * Все точки входа getColor:
+     *  - корневой: static int-метод с boolean[] и одним int (в 12.10.6 -- w0);
+     *  - вариант с провайдером ресурсов: static int-метод (int, <interface>) (в 12.10.6 -- v0);
+     *    именно им пользуются чат и стеклянные панели;
+     *  - запасной вариант, если корневого нет: static (I)I.
+     */
     private static List<Method> findGetColorMethods(Class<?> themeClass) {
         List<Method> primary = new ArrayList<>();
+        List<Method> providerVariants = new ArrayList<>();
         List<Method> fallback = new ArrayList<>();
         Method[] methods;
         try {
@@ -194,6 +226,13 @@ public class HookEntry implements IXposedHookLoadPackage {
         for (Method m : methods) {
             if (!Modifier.isStatic(m.getModifiers()) || m.getReturnType() != int.class) continue;
             Class<?>[] p = m.getParameterTypes();
+
+            // (int key, ResourceProvider provider)
+            if (p.length == 2 && p[0] == int.class && !p[1].isPrimitive() && p[1].isInterface()) {
+                providerVariants.add(m);
+                continue;
+            }
+
             if (p.length == 0 || p.length > 3 || !onlyColorParamTypes(p)) continue;
 
             int ints = 0;
@@ -207,7 +246,9 @@ public class HookEntry implements IXposedHookLoadPackage {
             if (hasBoolArray) primary.add(m);
             else if (p.length == 1) fallback.add(m);
         }
-        return primary.isEmpty() ? fallback : primary;
+        List<Method> result = new ArrayList<>(primary.isEmpty() ? fallback : primary);
+        result.addAll(providerVariants);
+        return result;
     }
 
     /** Ищет static no-arg метод -> SparseArray с "windowBackgroundWhite" и возвращает имя->ключ. */
@@ -276,6 +317,7 @@ public class HookEntry implements IXposedHookLoadPackage {
 
                 Set<Integer> bg = new HashSet<>();
                 Set<Integer> txt = new HashSet<>();
+                Set<Integer> pnl = new HashSet<>();
                 Map<Integer, String> names = new HashMap<>();
 
                 for (String n : BG_NAMES) {
@@ -292,15 +334,24 @@ public class HookEntry implements IXposedHookLoadPackage {
                         names.put(k, n);
                     }
                 }
-                if (bg.isEmpty() && txt.isEmpty()) {
+                for (String n : PANEL_NAMES) {
+                    Integer k = nameToKey.get(n);
+                    if (k != null && !bg.contains(k)) {
+                        pnl.add(k);
+                        names.put(k, n);
+                    }
+                }
+                if (bg.isEmpty() && txt.isEmpty() && pnl.isEmpty()) {
                     keysResolveFailed = true;
                     XposedBridge.log("[TT] нужные имена ключей не найдены в карте");
                     return;
                 }
                 keyNamesByValue = names;
                 textKeys = txt;
+                panelKeys = pnl;
                 backgroundKeys = bg; // последним: по нему проверяется готовность
-                XposedBridge.log("[TT] ключи разрешены: bg=" + bg.size() + ", text=" + txt.size());
+                XposedBridge.log("[TT] ключи разрешены: bg=" + bg.size() + ", text=" + txt.size()
+                        + ", panel=" + pnl.size());
             } finally {
                 resolving = false;
             }
@@ -313,6 +364,76 @@ public class HookEntry implements IXposedHookLoadPackage {
         int b = color & 0xFF;
         int luminance = (r * 299 + g * 587 + b * 114) / 1000;
         return luminance < 110;
+    }
+
+    // =====================================================================
+    // Фон чата: SizeNotifierFrameLayout.setSkipBackgroundDrawing
+    // =====================================================================
+
+    private static final WeakHashMap<Object, Boolean> SKIP_APPLIED = new WeakHashMap<>();
+
+    private static Class<?> findSkipBackgroundClass(ClassLoader cl) {
+        // 1. Необфусцированное имя (стабильные сборки, форки).
+        Class<?> direct = XposedHelpers.findClassIfExists(SIZE_NOTIFIER_NAME, cl);
+        if (direct != null && hasSkipMethod(direct)) return direct;
+
+        // 2. Структурно: класс-View в org.telegram.ui.Components с методом setSkipBackgroundDrawing(boolean).
+        for (Class<?> k : listClasses(cl, COMPONENTS_PKG)) {
+            try {
+                if (!View.class.isAssignableFrom(k)) continue;
+                if (hasSkipMethod(k)) return k;
+            } catch (Throwable ignored) {
+            }
+        }
+        return null;
+    }
+
+    private static boolean hasSkipMethod(Class<?> k) {
+        try {
+            k.getDeclaredMethod(SKIP_BG_METHOD, boolean.class);
+            return true;
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    private static void hookChatBackground(ClassLoader cl) {
+        try {
+            final Class<?> sn = findSkipBackgroundClass(cl);
+            if (sn == null) {
+                XposedBridge.log("[TT] класс с " + SKIP_BG_METHOD + " не найден -- обои чата не отключены");
+                return;
+            }
+            XposedBridge.log("[TT] SizeNotifier class = " + sn.getName());
+
+            // Всегда true: ChatActivity сам вызывает setSkipBackgroundDrawing(false) после анимаций.
+            XposedHelpers.findAndHookMethod(sn, SKIP_BG_METHOD, boolean.class, new XC_MethodHook() {
+                @Override
+                protected void beforeHookedMethod(MethodHookParam param) {
+                    param.args[0] = Boolean.TRUE;
+                }
+            });
+
+            // Один раз на экземпляр: включаем пропуск отрисовки обоев.
+            XposedHelpers.findAndHookMethod(sn, "onAttachedToWindow", new XC_MethodHook() {
+                @Override
+                protected void afterHookedMethod(MethodHookParam param) {
+                    try {
+                        Object self = param.thisObject;
+                        synchronized (SKIP_APPLIED) {
+                            if (SKIP_APPLIED.containsKey(self)) return;
+                            SKIP_APPLIED.put(self, Boolean.TRUE);
+                        }
+                        XposedHelpers.callMethod(self, SKIP_BG_METHOD, Boolean.TRUE);
+                    } catch (Throwable t) {
+                        XposedBridge.log("[TT] skip background failed: " + t);
+                    }
+                }
+            });
+            XposedBridge.log("[TT] chat background hooks installed");
+        } catch (Throwable t) {
+            XposedBridge.log("[TT] hookChatBackground failed: " + t);
+        }
     }
 
     // =====================================================================
@@ -373,7 +494,7 @@ public class HookEntry implements IXposedHookLoadPackage {
 
         // ---------- 2. Theme.getColor: структурный поиск ----------
         try {
-            List<Class<?>> classes = listActionBarClasses(cl);
+            List<Class<?>> classes = listClasses(cl, ACTIONBAR_PKG);
             uiClasses = classes;
             XposedBridge.log("[TT] классов в " + ACTIONBAR_PKG + ": " + classes.size());
 
@@ -390,6 +511,9 @@ public class HookEntry implements IXposedHookLoadPackage {
         } catch (Throwable t) {
             XposedBridge.log("[TT] структурный поиск Theme упал: " + t);
         }
+
+        // ---------- 2b. Фон чата ----------
+        hookChatBackground(cl);
 
         // ---------- 3. View.setBackgroundColor / setBackground ----------
         try {
@@ -490,10 +614,6 @@ public class HookEntry implements IXposedHookLoadPackage {
         } catch (Throwable t) {
             XposedBridge.log("[TT] Canvas hooks failed for " + packageName + ": " + t);
         }
-
-        // Старые хуки ActionBar / BlurredBackground* / DialogsActivityTopBubblesFadeView
-        // удалены: в 12.10.5 этих классов по старым именам уже нет (обфусцированы),
-        // а цвета шапки и стекла теперь идут через Theme.getColor и View/Canvas-хуки выше.
     }
 
     /** Хук одного варианта getColor. keyArgIndex -- индекс int-ключа в параметрах. */
@@ -509,7 +629,8 @@ public class HookEntry implements IXposedHookLoadPackage {
                         resolveKeys();
                         Set<Integer> bg = backgroundKeys;
                         Set<Integer> txt = textKeys;
-                        if (bg == null && txt == null) return;
+                        Set<Integer> pnl = panelKeys;
+                        if (bg == null && txt == null && pnl == null) return;
 
                         int key = (Integer) param.args[keyArgIndex];
                         Object resultObj = param.getResult();
@@ -525,6 +646,21 @@ public class HookEntry implements IXposedHookLoadPackage {
                                             + (names != null ? names.get(key) : key) + "): "
                                             + Integer.toHexString(original) + " -> "
                                             + Integer.toHexString(WINDOW_BACKGROUND_COLOR));
+                                }
+                            }
+                            return;
+                        }
+
+                        if (pnl != null && pnl.contains(key)) {
+                            if (Color.alpha(original) > PANEL_ALPHA) {
+                                int patched = (original & 0x00FFFFFF) | (PANEL_ALPHA << 24);
+                                param.setResult(patched);
+                                if (getColorPatchLogCount.incrementAndGet() <= 60) {
+                                    Map<Integer, String> names = keyNamesByValue;
+                                    XposedBridge.log("[TT] PANEL " + label + "("
+                                            + (names != null ? names.get(key) : key) + "): "
+                                            + Integer.toHexString(original) + " -> "
+                                            + Integer.toHexString(patched));
                                 }
                             }
                             return;
