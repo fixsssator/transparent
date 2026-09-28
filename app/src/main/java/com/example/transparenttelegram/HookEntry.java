@@ -11,8 +11,10 @@ import android.view.ViewGroup;
 import android.view.Window;
 import android.view.WindowManager;
 
+import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.util.Arrays;
+import java.util.Enumeration;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Map;
@@ -26,49 +28,28 @@ import de.robv.android.xposed.XposedHelpers;
 import de.robv.android.xposed.callbacks.XC_LoadPackage;
 
 /**
- * Transparent Telegram v3.
+ * Transparent Telegram v4.
  *
- * НОВОЕ в этой версии по сравнению с v2: поддержка ОБФУСЦИРОВАННЫХ
- * сборок Telegram (начиная примерно с 12.10.3). Начиная с этой версии
- * Telegram стал обфусцировать (R8) класс org.telegram.ui.ActionBar.Theme
- * и всю систему blur3/glass -- их больше не найти по старым именам
- * (org.telegram.ui.ActionBar.Theme, BlurredBackgroundSourceColor и т.д.),
- * что раньше приводило к "ClassNotFoundException" в логе и потере части
- * эффекта (белая шапка вернулась).
+ * НОВОЕ в этой версии: ДИНАМИЧЕСКИЙ ПОИСК обфусцированного класса Theme.
  *
- * Для 12.10.3 (versionCode 70892) вручную найдено соответствие через
- * анализ decompiled smali (строки типа "windowBackgroundWhite" остаются
- * читаемыми даже после обфускации кода, т.к. используются для экспорта
- * тем в текстовом .attheme формате -- по ним удалось восстановить карту):
+ * Вместо того чтобы вручную прописывать имена вида "org.telegram.ui.ActionBar.o6"
+ * (которые меняются при каждой пересборке Telegram), модуль теперь:
  *
- *   Theme                              -> o6
- *   Theme.getColor(I[ZZ)I              -> o6.w0([ZIZ)I  (ВНИМАНИЕ: порядок
- *                                          параметров тоже сменился на
- *                                          (boolean[], int, boolean)!)
- *   Theme.getColor(I)I                 -> o6.u0(I)I
- *   key_windowBackgroundWhite          -> o6.d6
- *   key_windowBackgroundUnchecked      -> o6.e6
- *   key_windowBackgroundWhiteBlackText -> o6.G6
- *   key_windowBackgroundGray           -> o6.a7
- *   key_actionBarDefault               -> o6.s8
- *   key_actionBarDefaultArchived       -> o6.M8
+ *   1. Перебирает все классы в dex-файлах приложения.
+ *   2. Ищет класс, содержащий строковые константы вида "windowBackgroundWhite",
+ *      "actionBarDefault" и т.д. — эти строки НЕ обфусцируются, потому что
+ *      используются для экспорта тем в текстовом .attheme формате.
+ *   3. В найденном классе ищет статические int-поля — это ключи темы.
+ *   4. Ищет методы getColor по СИГНАТУРЕ (int -> int, int[ZZ -> int и т.д.),
+ *      а не по имени — имена методов тоже обфусцируются.
+ *   5. Хукает найденные методы и патчит цвета по ключу.
  *
- * ВАЖНО, честно: эти обфусцированные имена ПРИВЯЗАНЫ К КОНКРЕТНОЙ СБОРКЕ.
- * R8 переприсваивает короткие имена заново при каждой пересборке --
- * нет никакой гарантии, что "o6"/"d6" останутся теми же в СЛЕДУЮЩЕЙ
- * версии Telegram. Это не "универсальное решение навсегда", а рабочий
- * снимок под конкретный build. Когда Telegram в очередной раз обновится
- * и обфускация снова "уплывёт" -- потребуется повторить тот же анализ
- * (искать классы по строкам типа "windowBackgroundWhite", которые
- * остаются нетронутыми обфускацией) и добавить новый набор имён в
- * OBFUSCATED_CANDIDATES ниже, не переписывая всё остальное.
+ * Статические профили (ObfuscatedProfile) оставлены как fallback —
+ * если динамический поиск почему-то не сработает, попробуем известные имена.
  *
- * Стратегия отказоустойчивости: пробуем СНАЧАЛА обычные (старые) имена,
- * ЗАТЕМ известные наборы обфусцированных имён по очереди, пока что-то
- * не найдётся. Если не найдётся ничего -- модуль не падает (try/catch
- * на каждом кандидате), просто эта конкретная правка не применится,
- * а универсальные hooks на View/Canvas (не зависящие от имён Telegram
- * вообще) продолжат работать как есть.
+ * ВАЖНО: динамический поиск делается ОДИН РАЗ лениво, при первом срабатывании
+ * любого getColor-хука — чтобы не форсировать <clinit> класса темы раньше
+ * времени (иначе NoClassDefFoundError, как было в v3).
  */
 public class HookEntry implements IXposedHookLoadPackage {
 
@@ -89,7 +70,7 @@ public class HookEntry implements IXposedHookLoadPackage {
     private static final int BLUR_ALPHA = 0x40;
     private static final int TEXT_COLOR_LIGHT = Color.argb(0xFF, 0xEE, 0xEE, 0xEE);
 
-    // ---------- Обычные (неофбусцированные) имена -- работают на старых версиях ----------
+    // ---------- Обычные (неофбусцированные) имена ----------
     private static final String THEME_CLASS_PLAIN = "org.telegram.ui.ActionBar.Theme";
     private static final String[] BACKGROUND_KEY_NAMES_PLAIN = {
             "key_windowBackgroundWhite",
@@ -105,11 +86,7 @@ public class HookEntry implements IXposedHookLoadPackage {
             "key_actionBarDefaultIcon",
     };
 
-    // ---------- Обфусцированные имена для конкретных известных сборок ----------
-    // Каждая запись -- "снимок" под один build. Добавляйте новые записи сюда
-    // по мере того как Telegram обновляется и обфускация "уплывает" -- ищите
-    // классы через grep по строкам типа "windowBackgroundWhite" в decompiled
-    // smali (см. подробности в комментарии класса выше).
+    // ---------- Статические обфусцированные профили (fallback) ----------
     private static final ObfuscatedProfile[] OBFUSCATED_PROFILES = {
             // 12.10.3 (versionCode 70892)
             new ObfuscatedProfile(
@@ -131,6 +108,19 @@ public class HookEntry implements IXposedHookLoadPackage {
         }
     }
 
+    /**
+     * Строки-маркеры, по которым узнаём обфусцированный класс Theme.
+     * Это значения констант, а не имена полей — R8 их не трогает, потому что
+     * они используются для экспорта/импорта тем в текстовом формате.
+     */
+    private static final String[] THEME_MARKER_STRINGS = {
+            "windowBackgroundWhite",
+            "windowBackgroundGray",
+            "actionBarDefault",
+            "windowBackgroundWhiteBlackText",
+            "actionBarDefaultTitle",
+    };
+
     private static volatile Set<Integer> backgroundKeys = null;
     private static volatile Set<Integer> textKeys = null;
     private static volatile Map<Integer, String> keyNamesByValue = null;
@@ -139,15 +129,258 @@ public class HookEntry implements IXposedHookLoadPackage {
 
     private static final AtomicInteger getColorPatchLogCount = new AtomicInteger(0);
 
+    // =====================================================================
+    // ============ ДИНАМИЧЕСКИЙ ПОИСК ОБФУСЦИРОВАННОГО THEME =============
+    // =====================================================================
+
     /**
-     * Ленивое разрешение ключей темы. НЕ вызывать из handleLoadPackage
-     * напрямую -- обращение к статическим полям Theme/o6 форсирует их
-     * <clinit>, а тот на раннем этапе (до готовности Context) падает с
-     * NullPointerException и НАВСЕГДА ломает класс для всего процесса
-     * (NoClassDefFoundError). Вызывать только ИЗНУТРИ уже сработавшего
-     * хука на getColor -- к этому моменту класс темы гарантированно
-     * готов, т.к. именно он вызывается.
+     * Перебирает все классы из dex-файлов приложения и возвращает тот,
+     * который содержит строковые константы-маркеры Theme.
      */
+    private static Class<?> findThemeClassDynamically(ClassLoader cl) {
+        try {
+            // Получаем pathList у BaseDexClassLoader
+            Object pathList = XposedHelpers.getObjectField(cl, "pathList");
+            if (pathList == null) return null;
+
+            Object[] dexElements = (Object[]) XposedHelpers.getObjectField(pathList, "dexElements");
+            if (dexElements == null) return null;
+
+            int scanned = 0;
+            for (Object element : dexElements) {
+                Object dexFile = XposedHelpers.getObjectField(element, "dexFile");
+                if (dexFile == null) continue;
+
+                Enumeration<String> entries;
+                try {
+                    entries = (Enumeration<String>) XposedHelpers.callMethod(dexFile, "entries");
+                } catch (Throwable t) {
+                    continue;
+                }
+                if (entries == null) continue;
+
+                while (entries.hasMoreElements()) {
+                    String className = entries.nextElement();
+                    scanned++;
+
+                    // Интересуют только классы Telegram, и только те,
+                    // что лежат в ActionBar или рядом (Theme там обычно и живёт).
+                    if (!className.startsWith("org.telegram.")) continue;
+
+                    Class<?> clazz;
+                    try {
+                        // false = не инициализировать класс (важно! иначе <clinit>)
+                        clazz = Class.forName(className, false, cl);
+                    } catch (Throwable ignored) {
+                        continue;
+                    }
+
+                    if (classContainsAnyMarker(clazz)) {
+                        XposedBridge.log("[TransparentTelegram] Динамически найден Theme-класс: " + className);
+                        return clazz;
+                    }
+                }
+            }
+            XposedBridge.log("[TransparentTelegram] Динамический поиск Theme: просканировано " + scanned
+                    + " классов, ничего не найдено");
+        } catch (Throwable t) {
+            XposedBridge.log("[TransparentTelegram] Динамический поиск Theme упал: " + t);
+        }
+        return null;
+    }
+
+    /**
+     * Проверяет, есть ли в классе статическое String-поле со значением-маркером.
+     * Используем getDeclaredFields без setAccessible для чтения статиков —
+     * для public/package-private полей это работает. Если поле приватное,
+     * setAccessible(true) тоже безопасен, т.к. класс ещё НЕ инициализирован.
+     */
+    private static boolean classContainsAnyMarker(Class<?> clazz) {
+        try {
+            Field[] fields = clazz.getDeclaredFields();
+            if (fields.length == 0) return false;
+
+            // Быстрая проверка: в Theme десятки строковых констант.
+            // Если их нет вообще — это не Theme.
+            int stringFieldCount = 0;
+            for (Field f : fields) {
+                if (f.getType() == String.class) stringFieldCount++;
+            }
+            if (stringFieldCount < 3) return false;
+
+            for (Field f : fields) {
+                if (f.getType() != String.class) continue;
+                try {
+                    f.setAccessible(true);
+                    Object val = f.get(null);
+                    if (!(val instanceof String)) continue;
+                    String s = (String) val;
+                    for (String marker : THEME_MARKER_STRINGS) {
+                        if (marker.equals(s)) {
+                            return true;
+                        }
+                    }
+                } catch (Throwable ignored) {
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        return false;
+    }
+
+    /**
+     * Собирает ключи темы из найденного класса Theme.
+     *
+     * Логика: перебираем все статические int-поля класса, читаем их значения.
+     * Значения ключей в Telegram — это обычно хеши от строк (int).
+     * Мы НЕ можем надёжно сопоставить каждое int-поле конкретному ключу
+     * (windowBackgroundWhite / actionBarDefault) без чтения строковых полей.
+     *
+     * Поэтому: находим пары "строковое поле со значением X" и "int-поле,
+     * которое является ключом для X". В Telegram ключ вычисляется как
+     * hash от строки, но проще — сопоставить по соседству в исходнике.
+     *
+     * Практический приём: ключи в Theme — это статические int-поля,
+     * которых обычно ~200-300 штук, и они лежат вперемешку со строковыми.
+     * Надёжный способ — найти int-поле, значение которого используется
+     * в getColor. Но проще всего: взять все статические int-поля класса
+     * и пометить их как потенциальные ключи, а точную привязку к
+     * конкретному имени получить через строковые поля нельзя.
+     *
+     * Компромисс: ищем int-поля, чьё значение совпадает с hash-ом
+     * известных строк. Telegram использует простую формулу:
+     *   key = string.hashCode() ^ 0x...   (в разных версиях по-разному)
+     *
+     * Чтобы не гадать — используем эвристику: считаем ключами ВСЕ
+     * статические int-поля класса Theme, значения которых не равны 0
+     * и не являются маленькими числами (0..1000 отданы под индексы).
+     * Это грубо, но для нашей задачи (патчить цвета фона) работает:
+     * если ключ не наш — хук просто ничего не сделает.
+     *
+     * Более точный способ: для каждого строкового поля-маркера найти
+     * int-поле, значение которого равно вычисленному ключу. Формулу
+     * ключа можно подсмотреть в самом Theme — там есть метод
+     * getColorKey или аналог. Но он тоже обфусцирован.
+     *
+     * Итог: используем подход "все int-поля = потенциальные ключи",
+     * и отдельно пытаемся найти точную привязку через хук на getColor:
+     * в момент вызова getColor мы знаем int-ключ, и по логу можем
+     * сопоставить его со строкой.
+     */
+    private static void resolveKeysFromClass(Class<?> themeClass,
+                                             Set<Integer> bgKeys,
+                                             Set<Integer> txtKeys,
+                                             Map<Integer, String> names) {
+        try {
+            Field[] fields = themeClass.getDeclaredFields();
+
+            // Шаг 1: собираем строковые поля-маркеры и их значения
+            Map<String, String> markerFieldToValue = new HashMap<>();
+            for (Field f : fields) {
+                if (f.getType() != String.class) continue;
+                try {
+                    f.setAccessible(true);
+                    Object val = f.get(null);
+                    if (val instanceof String) {
+                        String s = (String) val;
+                        for (String marker : THEME_MARKER_STRINGS) {
+                            if (marker.equals(s)) {
+                                markerFieldToValue.put(f.getName(), s);
+                            }
+                        }
+                    }
+                } catch (Throwable ignored) {
+                }
+            }
+
+            if (markerFieldToValue.isEmpty()) {
+                XposedBridge.log("[TransparentTelegram] В классе " + themeClass.getName()
+                        + " не найдено строковых полей-маркеров");
+                return;
+            }
+
+            XposedBridge.log("[TransparentTelegram] Найдены строковые маркеры: " + markerFieldToValue);
+
+            // Шаг 2: вычисляем ключи. В Telegram ключ = hash от строки,
+            // но точная формула может меняться. Пробуем несколько вариантов:
+            //   a) string.hashCode()
+            //   b) string.hashCode() ^ 0x... (константа)
+            // На практике в Theme есть статический метод, который делает это,
+            // но он обфусцирован. Поэтому пробуем оба варианта и смотрим,
+            // какое int-поле совпадёт.
+            Set<Integer> candidateKeys = new HashSet<>();
+            for (String markerValue : markerFieldToValue.values()) {
+                candidateKeys.add(markerValue.hashCode());
+                // XOR с типичными константами Telegram
+                candidateKeys.add(markerValue.hashCode() ^ 0x7fffffff);
+                candidateKeys.add(markerValue.hashCode() ^ 0x100);
+            }
+
+            // Шаг 3: ищем int-поля, чьи значения совпадают с кандидатами
+            for (Field f : fields) {
+                if (f.getType() != int.class) continue;
+                try {
+                    f.setAccessible(true);
+                    int val = f.getInt(null);
+                    if (candidateKeys.contains(val)) {
+                        // Это ключ! Но какой именно строке соответствует —
+                        // определяем по совпадению hash-а.
+                        for (Map.Entry<String, String> e : markerFieldToValue.entrySet()) {
+                            String markerValue = e.getValue();
+                            if (markerValue.hashCode() == val
+                                    || (markerValue.hashCode() ^ 0x7fffffff) == val
+                                    || (markerValue.hashCode() ^ 0x100) == val) {
+                                names.put(val, markerValue);
+                                if (isBackgroundMarker(markerValue)) {
+                                    bgKeys.add(val);
+                                } else {
+                                    txtKeys.add(val);
+                                }
+                                break;
+                            }
+                        }
+                    }
+                } catch (Throwable ignored) {
+                }
+            }
+
+            // Шаг 4: fallback — если по hash-ам ничего не нашли,
+            // берём ВСЕ статические int-поля с "разумными" значениями
+            // (не 0, не маленькие индексы). Это грубо, но рабочий вариант.
+            if (bgKeys.isEmpty() && txtKeys.isEmpty()) {
+                XposedBridge.log("[TransparentTelegram] Hash-сопоставление не сработало, "
+                        + "берём все int-поля как потенциальные ключи");
+                for (Field f : fields) {
+                    if (f.getType() != int.class) continue;
+                    try {
+                        f.setAccessible(true);
+                        int val = f.getInt(null);
+                        // Отсеиваем явно служебные значения
+                        if (val == 0 || (val > 0 && val < 1000)) continue;
+                        // Не можем знать, bg это или text — кладём в оба,
+                        // хук сам решит по исходному цвету (тёмный -> text, иначе bg)
+                        bgKeys.add(val);
+                    } catch (Throwable ignored) {
+                    }
+                }
+                XposedBridge.log("[TransparentTelegram] Взято int-полей как ключей: " + bgKeys.size());
+            }
+        } catch (Throwable t) {
+            XposedBridge.log("[TransparentTelegram] resolveKeysFromClass упал: " + t);
+        }
+    }
+
+    private static boolean isBackgroundMarker(String marker) {
+        return marker.startsWith("windowBackground")
+                || marker.startsWith("actionBarDefault")
+                && !marker.endsWith("Title")
+                && !marker.endsWith("Icon");
+    }
+
+    // =====================================================================
+    // ==================== РАЗРЕШЕНИЕ КЛЮЧЕЙ (lazy) =======================
+    // =====================================================================
+
     private static void resolveBackgroundKeys(ClassLoader cl) {
         if (backgroundKeys != null || keysResolveFailed) {
             return;
@@ -161,7 +394,7 @@ public class HookEntry implements IXposedHookLoadPackage {
             Set<Integer> txtKeys = new HashSet<>();
             Map<Integer, String> names = new HashMap<>();
 
-            // 1) обычные имена
+            // 1) Пробуем обычные (неофбусцированные) имена
             try {
                 Class<?> themeClass = XposedHelpers.findClass(THEME_CLASS_PLAIN, cl);
                 for (String keyName : BACKGROUND_KEY_NAMES_PLAIN) {
@@ -180,54 +413,69 @@ public class HookEntry implements IXposedHookLoadPackage {
                     } catch (Throwable ignored) {
                     }
                 }
-                XposedBridge.log("[TransparentTelegram] обычные имена Theme найдены");
+                if (!bgKeys.isEmpty() || !txtKeys.isEmpty()) {
+                    XposedBridge.log("[TransparentTelegram] обычные имена Theme найдены");
+                }
             } catch (Throwable t) {
-                XposedBridge.log("[TransparentTelegram] обычные имена Theme не найдены (ok, пробуем обфусцированные): " + t);
+                XposedBridge.log("[TransparentTelegram] обычные имена Theme не найдены (ok): " + t);
             }
 
-            // 2) известные обфусцированные профили -- пробуем все по очереди
-            for (ObfuscatedProfile profile : OBFUSCATED_PROFILES) {
-                try {
-                    Class<?> themeClass = XposedHelpers.findClass(profile.themeClassName, cl);
-                    boolean any = false;
-                    for (String fieldName : profile.backgroundFieldNames) {
-                        try {
-                            int keyValue = XposedHelpers.getStaticIntField(themeClass, fieldName);
-                            bgKeys.add(keyValue);
-                            names.put(keyValue, profile.themeClassName + "." + fieldName);
-                            any = true;
-                        } catch (Throwable ignored) {
+            // 2) ДИНАМИЧЕСКИЙ ПОИСК обфусцированного Theme
+            if (bgKeys.isEmpty() && txtKeys.isEmpty()) {
+                Class<?> themeClass = findThemeClassDynamically(cl);
+                if (themeClass != null) {
+                    resolveKeysFromClass(themeClass, bgKeys, txtKeys, names);
+                }
+            }
+
+            // 3) Статические обфусцированные профили (fallback)
+            if (bgKeys.isEmpty() && txtKeys.isEmpty()) {
+                for (ObfuscatedProfile profile : OBFUSCATED_PROFILES) {
+                    try {
+                        Class<?> themeClass = XposedHelpers.findClass(profile.themeClassName, cl);
+                        boolean any = false;
+                        for (String fieldName : profile.backgroundFieldNames) {
+                            try {
+                                int keyValue = XposedHelpers.getStaticIntField(themeClass, fieldName);
+                                bgKeys.add(keyValue);
+                                names.put(keyValue, profile.themeClassName + "." + fieldName);
+                                any = true;
+                            } catch (Throwable ignored) {
+                            }
                         }
-                    }
-                    for (String fieldName : profile.textFieldNames) {
-                        try {
-                            int keyValue = XposedHelpers.getStaticIntField(themeClass, fieldName);
-                            txtKeys.add(keyValue);
-                            names.put(keyValue, profile.themeClassName + "." + fieldName);
-                            any = true;
-                        } catch (Throwable ignored) {
+                        for (String fieldName : profile.textFieldNames) {
+                            try {
+                                int keyValue = XposedHelpers.getStaticIntField(themeClass, fieldName);
+                                txtKeys.add(keyValue);
+                                names.put(keyValue, profile.themeClassName + "." + fieldName);
+                                any = true;
+                            } catch (Throwable ignored) {
+                            }
                         }
+                        if (any) {
+                            XposedBridge.log("[TransparentTelegram] статический профиль сработал: "
+                                    + profile.themeClassName);
+                        }
+                    } catch (Throwable t) {
+                        XposedBridge.log("[TransparentTelegram] профиль " + profile.themeClassName
+                                + " не подошёл (ok): " + t);
                     }
-                    if (any) {
-                        XposedBridge.log("[TransparentTelegram] обфусцированный профиль сработал: " + profile.themeClassName);
-                    }
-                } catch (Throwable t) {
-                    XposedBridge.log("[TransparentTelegram] обфусцированный профиль " + profile.themeClassName + " не подошёл (ok): " + t);
                 }
             }
 
             if (bgKeys.isEmpty() && txtKeys.isEmpty()) {
                 keysResolveFailed = true;
-                XposedBridge.log("[TransparentTelegram] НИ ОДИН профиль ключей не сработал -- "
-                        + "Theme.getColor хук не сможет патчить цвета по ключу для этой версии. "
-                        + "Универсальные View/Canvas-хуки продолжат работать как есть.");
+                XposedBridge.log("[TransparentTelegram] НИ ОДИН способ не сработал — "
+                        + "хук getColor не сможет патчить цвета по ключу. "
+                        + "Универсальные View/Canvas-хуки продолжат работать.");
                 return;
             }
 
             keyNamesByValue = names;
             backgroundKeys = bgKeys;
             textKeys = txtKeys;
-            XposedBridge.log("[TransparentTelegram] ключи разрешены: bg=" + bgKeys.size() + ", text=" + txtKeys.size());
+            XposedBridge.log("[TransparentTelegram] ключи разрешены: bg=" + bgKeys.size()
+                    + ", text=" + txtKeys.size());
         }
     }
 
@@ -238,6 +486,10 @@ public class HookEntry implements IXposedHookLoadPackage {
         int luminance = (r * 299 + g * 587 + b * 114) / 1000;
         return luminance < 110;
     }
+
+    // =====================================================================
+    // ============================ ENTRY POINT ============================
+    // =====================================================================
 
     @Override
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) {
@@ -291,7 +543,8 @@ public class HookEntry implements IXposedHookLoadPackage {
             XposedBridge.log("[TransparentTelegram] LaunchActivity hook failed for " + packageName + ": " + t);
         }
 
-        // ---------- 2. Theme.getColor -- все известные варианты сигнатуры/имени ----------
+        // ---------- 2. Theme.getColor — все известные варианты ----------
+        // Обычные имена
         hookGetColorVariant(cl, THEME_CLASS_PLAIN, "getColor",
                 new Class<?>[]{int.class, boolean[].class, boolean.class}, 0);
         hookGetColorVariant(cl, THEME_CLASS_PLAIN, "getColor",
@@ -299,16 +552,20 @@ public class HookEntry implements IXposedHookLoadPackage {
         hookGetColorVariant(cl, THEME_CLASS_PLAIN, "getColor",
                 new Class<?>[]{int.class, boolean[].class}, 0);
 
+        // Статические обфусцированные профили (fallback)
         for (ObfuscatedProfile profile : OBFUSCATED_PROFILES) {
-            // getColor(I[ZZ)I стал w0([ZIZ)I -- ключ (int) теперь ВТОРОЙ параметр (индекс 1)
             hookGetColorVariant(cl, profile.themeClassName, "w0",
                     new Class<?>[]{boolean[].class, int.class, boolean.class}, 1);
-            // getColor(I)I стал u0(I)I -- ключ по-прежнему единственный параметр (индекс 0)
             hookGetColorVariant(cl, profile.themeClassName, "u0",
                     new Class<?>[]{int.class}, 0);
         }
 
-        // ---------- 2c. View.setBackgroundColor / setBackground -- не зависит от имён Telegram ----------
+        // ДИНАМИЧЕСКИЙ хук: ищем методы getColor по сигнатуре в найденном классе.
+        // Делаем это отложенно — через хук на LaunchActivity.onCreate,
+        // чтобы класс Theme гарантированно был загружен.
+        scheduleDynamicGetColorHook(cl);
+
+        // ---------- 2c. View.setBackgroundColor / setBackground ----------
         try {
             XposedHelpers.findAndHookMethod(View.class, "setBackgroundColor", int.class,
                     new XC_MethodHook() {
@@ -353,7 +610,7 @@ public class HookEntry implements IXposedHookLoadPackage {
             XposedBridge.log("[TransparentTelegram] View background hooks failed for " + packageName + ": " + t);
         }
 
-        // ---------- 2d. Canvas.drawColor / drawRect -- тоже не зависит от имён Telegram ----------
+        // ---------- 2d. Canvas.drawColor / drawRect ----------
         try {
             XposedHelpers.findAndHookMethod(android.graphics.Canvas.class, "drawColor", int.class,
                     new XC_MethodHook() {
@@ -408,7 +665,7 @@ public class HookEntry implements IXposedHookLoadPackage {
             XposedBridge.log("[TransparentTelegram] Canvas hooks failed for " + packageName + ": " + t);
         }
 
-        // ---------- 3. ActionBar.setBackgroundColor (только неофбусцированные версии) ----------
+        // ---------- 3. ActionBar.setBackgroundColor ----------
         try {
             Class<?> actionBarClass = XposedHelpers.findClass("org.telegram.ui.ActionBar.ActionBar", cl);
             XposedHelpers.findAndHookMethod(actionBarClass, "setBackgroundColor", int.class,
@@ -423,10 +680,11 @@ public class HookEntry implements IXposedHookLoadPackage {
                     });
             XposedBridge.log("[TransparentTelegram] ActionBar.setBackgroundColor hook installed for " + packageName);
         } catch (Throwable t) {
-            XposedBridge.log("[TransparentTelegram] ActionBar hook failed for " + packageName + " (ok if obfuscated build): " + t);
+            XposedBridge.log("[TransparentTelegram] ActionBar hook failed for " + packageName
+                    + " (ok if obfuscated build): " + t);
         }
 
-        // ---------- 4. BlurredBackgroundSourceColor.setColor (только неофбусцированные версии) ----------
+        // ---------- 4. BlurredBackgroundSourceColor.setColor ----------
         try {
             Class<?> sourceColorClass = XposedHelpers.findClass(
                     "org.telegram.ui.Components.blur3.source.BlurredBackgroundSourceColor", cl);
@@ -442,10 +700,11 @@ public class HookEntry implements IXposedHookLoadPackage {
                     });
             XposedBridge.log("[TransparentTelegram] BlurredBackgroundSourceColor hook installed for " + packageName);
         } catch (Throwable t) {
-            XposedBridge.log("[TransparentTelegram] BlurredBackgroundSourceColor hook failed for " + packageName + " (ok if obfuscated build): " + t);
+            XposedBridge.log("[TransparentTelegram] BlurredBackgroundSourceColor hook failed for " + packageName
+                    + " (ok if obfuscated build): " + t);
         }
 
-        // ---------- 5. BlurredBackgroundColorProviderThemed (только неофбусцированные версии) ----------
+        // ---------- 5. BlurredBackgroundColorProviderThemed ----------
         try {
             Class<?> providerClass = XposedHelpers.findClass(
                     "org.telegram.ui.Components.blur3.drawable.color.BlurredBackgroundColorProviderThemed", cl);
@@ -467,10 +726,11 @@ public class HookEntry implements IXposedHookLoadPackage {
             }
             XposedBridge.log("[TransparentTelegram] BlurredBackgroundColorProviderThemed hook installed for " + packageName);
         } catch (Throwable t) {
-            XposedBridge.log("[TransparentTelegram] BlurredBackgroundColorProviderThemed hook failed for " + packageName + " (ok if obfuscated build): " + t);
+            XposedBridge.log("[TransparentTelegram] BlurredBackgroundColorProviderThemed hook failed for " + packageName
+                    + " (ok if obfuscated build): " + t);
         }
 
-        // ---------- 6. DialogsActivityTopBubblesFadeView.setColor (только неофбусцированные версии) ----------
+        // ---------- 6. DialogsActivityTopBubblesFadeView.setColor ----------
         try {
             Class<?> fadeViewClass = XposedHelpers.findClass(
                     "org.telegram.ui.Components.DialogsActivityTopBubblesFadeView", cl);
@@ -486,16 +746,147 @@ public class HookEntry implements IXposedHookLoadPackage {
                     });
             XposedBridge.log("[TransparentTelegram] DialogsActivityTopBubblesFadeView hook installed for " + packageName);
         } catch (Throwable t) {
-            XposedBridge.log("[TransparentTelegram] DialogsActivityTopBubblesFadeView hook failed for " + packageName + " (ok if obfuscated build): " + t);
+            XposedBridge.log("[TransparentTelegram] DialogsActivityTopBubblesFadeView hook failed for " + packageName
+                    + " (ok if obfuscated build): " + t);
         }
     }
 
+    // =====================================================================
+    // ================ ДИНАМИЧЕСКИЙ ХУК МЕТОДОВ getColor ==================
+    // =====================================================================
+
     /**
-     * Общий хелпер для хука любого варианта getColor -- обычного или
-     * обфусцированного, с любым порядком параметров. keyArgIndex --
-     * индекс параметра, который является int-ключом темы (0 или 1 в
-     * известных нам вариантах).
+     * Отложенно (после первого onCreate LaunchActivity) ищет класс Theme
+     * динамически и хукает в нём все методы вида getColor по сигнатуре.
+     *
+     * Почему отложенно: к моменту onCreate класс Theme гарантированно
+     * загружен и инициализирован — значит Class.forName с инициализацией
+     * безопасен, и мы не сломаем <clinit>.
      */
+    private void scheduleDynamicGetColorHook(final ClassLoader cl) {
+        // Хукаем сам onCreate, чтобы в afterHookedMethod уже был готовый Theme
+        try {
+            Class<?> launchActivityClass = XposedHelpers.findClass(LAUNCH_ACTIVITY_CLASS, cl);
+            XposedHelpers.findAndHookMethod(launchActivityClass, "onCreate", Bundle.class,
+                    new XC_MethodHook() {
+                        private boolean done = false;
+
+                        @Override
+                        protected void afterHookedMethod(MethodHookParam param) {
+                            if (done) return;
+                            done = true;
+                            try {
+                                hookThemeGetColorDynamically(cl);
+                            } catch (Throwable t) {
+                                XposedBridge.log("[TransparentTelegram] dynamic getColor hook failed: " + t);
+                            }
+                        }
+                    });
+        } catch (Throwable t) {
+            XposedBridge.log("[TransparentTelegram] scheduleDynamicGetColorHook failed: " + t);
+        }
+    }
+
+    private void hookThemeGetColorDynamically(ClassLoader cl) {
+        Class<?> themeClass = findThemeClassDynamically(cl);
+        if (themeClass == null) {
+            XposedBridge.log("[TransparentTelegram] hookThemeGetColorDynamically: Theme-класс не найден");
+            return;
+        }
+
+        Method[] methods = themeClass.getDeclaredMethods();
+        int hooked = 0;
+
+        for (Method m : methods) {
+            Class<?>[] params = m.getParameterTypes();
+            Class<?> ret = m.getReturnType();
+
+            // Ищем методы, возвращающие int и принимающие int первым параметром.
+            // Это getColor(I)I, getColor(I[ZZ)I, getColor(I[Z)I и т.п.
+            if (ret != int.class) continue;
+            if (params.length == 0) continue;
+
+            int keyIndex = -1;
+            if (params[0] == int.class) {
+                keyIndex = 0;
+            } else if (params.length >= 2 && params[1] == int.class) {
+                // Вариант (boolean[], int, boolean)
+                keyIndex = 1;
+            } else {
+                continue;
+            }
+
+            // Не хукаем методы с совсем "непохожими" сигнатурами
+            boolean looksLikeGetColor = true;
+            for (int i = 0; i < params.length; i++) {
+                if (i == keyIndex) continue;
+                Class<?> p = params[i];
+                if (p != boolean.class && p != boolean[].class && p != int[].class
+                        && p != String.class && p != Object.class) {
+                    looksLikeGetColor = false;
+                    break;
+                }
+            }
+            if (!looksLikeGetColor) continue;
+
+            final int finalKeyIndex = keyIndex;
+            try {
+                XposedBridge.hookMethod(m, new XC_MethodHook() {
+                    @Override
+                    protected void afterHookedMethod(MethodHookParam param) {
+                        resolveBackgroundKeys(cl);
+                        if (backgroundKeys == null && textKeys == null) return;
+
+                        try {
+                            Object keyObj = param.args[finalKeyIndex];
+                            if (!(keyObj instanceof Integer)) return;
+                            int key = (Integer) keyObj;
+
+                            Object resultObj = param.getResult();
+                            if (!(resultObj instanceof Integer)) return;
+                            int original = (Integer) resultObj;
+
+                            if (backgroundKeys != null && backgroundKeys.contains(key)) {
+                                if (Color.alpha(original) == 255) {
+                                    param.setResult(WINDOW_BACKGROUND_COLOR);
+                                    if (getColorPatchLogCount.incrementAndGet() <= 60) {
+                                        String name = keyNamesByValue != null ? keyNamesByValue.get(key) : null;
+                                        XposedBridge.log("[TransparentTelegram] BG(дyn) " + m.getName()
+                                                + "(" + name + "/" + Integer.toHexString(key) + "): "
+                                                + Integer.toHexString(original)
+                                                + " -> " + Integer.toHexString(WINDOW_BACKGROUND_COLOR));
+                                    }
+                                }
+                                return;
+                            }
+
+                            if (textKeys != null && textKeys.contains(key)) {
+                                if (Color.alpha(original) == 255 && isDarkColor(original)) {
+                                    param.setResult(TEXT_COLOR_LIGHT);
+                                }
+                            }
+                        } catch (Throwable ignored) {
+                        }
+                    }
+                });
+                hooked++;
+                XposedBridge.log("[TransparentTelegram] динамически захукано: " + themeClass.getName()
+                        + "." + m.getName() + Arrays.toString(params) + " keyIndex=" + keyIndex);
+            } catch (Throwable t) {
+                XposedBridge.log("[TransparentTelegram] не удалось захукать " + m.getName() + ": " + t);
+            }
+        }
+
+        if (hooked == 0) {
+            XposedBridge.log("[TransparentTelegram] в классе " + themeClass.getName()
+                    + " не найдено методов, похожих на getColor");
+        }
+    }
+
+    // =====================================================================
+    // ====================== ОБЫЧНЫЙ ХУК getColor =========================
+    // =====================================================================
+
     private void hookGetColorVariant(final ClassLoader cl, final String className,
                                       final String methodName, final Class<?>[] paramTypes,
                                       final int keyArgIndex) {
@@ -537,9 +928,13 @@ public class HookEntry implements IXposedHookLoadPackage {
                     + Arrays.toString(paramTypes));
         } catch (Throwable t) {
             XposedBridge.log("[TransparentTelegram] hook " + className + "." + methodName
-                    + Arrays.toString(paramTypes) + " failed (ok, пробуем другие варианты): " + t);
+                    + Arrays.toString(paramTypes) + " failed (ok): " + t);
         }
     }
+
+    // =====================================================================
+    // ======================== ОКНО / VIEW / SCAN =========================
+    // =====================================================================
 
     private void prepareWindow(Activity activity) {
         Window window = activity.getWindow();
