@@ -517,7 +517,7 @@ public class HookEntry implements IXposedHookLoadPackage {
      * визуально "почти не видно обоев", хотя в логе каждое отдельное значение выглядит прозрачным.
      * Поэтому здесь нужно заметно меньшее число, чем для панелей, которые рисуются один раз.
      */
-    private static final int GLASS_BLEND_ALPHA_CAP = 0x08;
+    private static final int GLASS_BLEND_ALPHA_CAP = 0x45;
 
     private static final AtomicInteger glassLogCount = new AtomicInteger(0);
 
@@ -982,12 +982,54 @@ public class HookEntry implements IXposedHookLoadPackage {
         }
     }
 
+    /**
+     * Диагностика. Даже альфа 0x08 в шапке визуально ничего не поменяла -- значит,
+     * скорее всего, тёмная область рисуется не через Theme.l1/w0/v0 вообще, а каким-то
+     * другим View, который наши хуки не патчат. Логируем класс, альфу и границы каждого
+     * View в верхних ~20% экрана (по одному разу на класс), чтобы увидеть в логе Xposed,
+     * что там на самом деле рисуется.
+     */
+    private static final boolean DEBUG_LOG_TOP_VIEWS = true;
+    private static final Set<String> loggedTopViewClasses = new HashSet<>();
+    private static final Object TOP_LOG_LOCK = new Object();
+
+    private void debugLogTopView(View view, Drawable bg, int rootHeight) {
+        if (!DEBUG_LOG_TOP_VIEWS) return;
+        try {
+            if (view.getTop() > rootHeight * 0.20f) return;
+            String cls = view.getClass().getName();
+            synchronized (TOP_LOG_LOCK) {
+                if (!loggedTopViewClasses.add(cls)) return;
+            }
+            String bgInfo = "null";
+            if (bg != null) {
+                bgInfo = bg.getClass().getName();
+                if (bg instanceof ColorDrawable) {
+                    bgInfo += " color=" + Integer.toHexString(((ColorDrawable) bg).getColor());
+                }
+            }
+            XposedBridge.log("[TT][DIAG] top=" + view.getTop() + " h=" + view.getHeight()
+                    + " w=" + view.getWidth() + " viewAlpha=" + viewAlphaOf(view)
+                    + " class=" + cls + " bg=" + bgInfo);
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private float viewAlphaOf(View v) {
+        try {
+            return (Float) View.class.getMethod("getAlpha").invoke(v);
+        } catch (Throwable t) {
+            return -1f;
+        }
+    }
+
     private void stripOpaqueBackgrounds(View view, int rootWidth, int rootHeight, int depth) {
         if (view == null || depth > 40) {
             return;
         }
 
         Drawable bg = view.getBackground();
+        debugLogTopView(view, bg, rootHeight);
 
         if (bg != null && isBlurDrawable(bg)) {
             try {
