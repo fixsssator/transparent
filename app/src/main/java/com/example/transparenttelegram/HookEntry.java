@@ -478,8 +478,8 @@ public class HookEntry implements IXposedHookLoadPackage {
                         if (!(resultObj instanceof Integer)) return;
                         int original = (Integer) resultObj;
                         int a = Color.alpha(original);
-                        if (a > PANEL_ALPHA && isDarkColor(original)) {
-                            int patched = (original & 0x00FFFFFF) | (PANEL_ALPHA << 24);
+                        if (a > GLASS_BLEND_ALPHA_CAP && isDarkColor(original)) {
+                            int patched = (original & 0x00FFFFFF) | (GLASS_BLEND_ALPHA_CAP << 24);
                             param.setResult(patched);
                             if (glassLogCount.incrementAndGet() <= 20) {
                                 XposedBridge.log("[TT] BLEND " + label + ": "
@@ -506,6 +506,18 @@ public class HookEntry implements IXposedHookLoadPackage {
     private static final int GLASS_DRAWCOLOR_CAP = 0x30;
     /** false -- не трогать полупрозрачные drawColor (если что-то лишнее стало прозрачным). */
     private static final boolean GLASS_PATCH_DRAWCOLOR = true;
+
+    /**
+     * У BLEND-хука (Theme.l1) отдельный, более низкий потолок альфы, чем у PANEL_ALPHA.
+     * Причина видна в байткоде: ch.e.A() рисует d.e (результат l1) через Canvas.drawColor
+     * ДВАЖДЫ подряд в один RecordingCanvas (до и после отрисовки вложенного RenderNode).
+     * Два одинаковых полупрозрачных слоя друг на друге складываются не линейно, а по формуле
+     * альфа-композитинга: итоговая_альфа = 1 - (1 - a)^2. Например a=0x28/255≈16% дают на
+     * выходе ≈29%, а поверх фона окна (тоже ~38% альфа) это уже больше половины непрозрачности --
+     * визуально "почти не видно обоев", хотя в логе каждое отдельное значение выглядит прозрачным.
+     * Поэтому здесь нужно заметно меньшее число, чем для панелей, которые рисуются один раз.
+     */
+    private static final int GLASS_BLEND_ALPHA_CAP = 0x08;
 
     private static final AtomicInteger glassLogCount = new AtomicInteger(0);
 
@@ -579,7 +591,7 @@ public class HookEntry implements IXposedHookLoadPackage {
      * ничего не знает про ключи тем и не может промахнуться мимо них.
      * По умолчанию выключено, чтобы не терять блюр без необходимости.
      */
-    private static final boolean DISABLE_GLASS_RENDER_EFFECT = true;
+    private static final boolean DISABLE_GLASS_RENDER_EFFECT = false;
 
     private static void hookRenderEffectKillSwitch() {
         if (!DISABLE_GLASS_RENDER_EFFECT) return;
