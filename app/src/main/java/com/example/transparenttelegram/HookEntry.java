@@ -579,7 +579,7 @@ public class HookEntry implements IXposedHookLoadPackage {
      * ничего не знает про ключи тем и не может промахнуться мимо них.
      * По умолчанию выключено, чтобы не терять блюр без необходимости.
      */
-    private static final boolean DISABLE_GLASS_RENDER_EFFECT = false;
+    private static final boolean DISABLE_GLASS_RENDER_EFFECT = true;
 
     private static void hookRenderEffectKillSwitch() {
         if (!DISABLE_GLASS_RENDER_EFFECT) return;
