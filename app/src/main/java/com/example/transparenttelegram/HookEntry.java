@@ -442,6 +442,82 @@ public class HookEntry implements IXposedHookLoadPackage {
     }
 
     // =====================================================================
+    // Стеклянные панели (liquid glass): шапки, закреп, пузыри в чате
+    // =====================================================================
+
+    /** Во сколько раз ослабить цвет-тонировку стекла (1.0 = как было, 0.0 = без тонировки). */
+    private static final float GLASS_TINT_SCALE = 0.35f;
+    /** Потолок альфы для полупрозрачных тёмных drawColor (тонировка стекла рисуется через drawColor). */
+    private static final int GLASS_DRAWCOLOR_CAP = 0x30;
+    /** false -- не трогать полупрозрачные drawColor (если что-то лишнее стало прозрачным). */
+    private static final boolean GLASS_PATCH_DRAWCOLOR = true;
+
+    private static final AtomicInteger glassLogCount = new AtomicInteger(0);
+
+    private static void hookGlass() {
+        // 1. Шейдер стекла принимает цвет тонировки как uniform "foreground_color_premultiplied"
+        //    (premultiplied RGBA). Домножение всех четырёх компонент = ослабление альфы тонировки.
+        try {
+            Class<?> rs = XposedHelpers.findClassIfExists("android.graphics.RuntimeShader", null);
+            if (rs != null) {
+                XposedHelpers.findAndHookMethod(rs, "setFloatUniform", String.class,
+                        float.class, float.class, float.class, float.class,
+                        new XC_MethodHook() {
+                            @Override
+                            protected void beforeHookedMethod(MethodHookParam param) {
+                                try {
+                                    if (!"foreground_color_premultiplied".equals(param.args[0])) return;
+                                    for (int i = 1; i <= 4; i++) {
+                                        param.args[i] = ((Float) param.args[i]) * GLASS_TINT_SCALE;
+                                    }
+                                    if (glassLogCount.incrementAndGet() <= 5) {
+                                        XposedBridge.log("[TT] glass tint scaled x" + GLASS_TINT_SCALE);
+                                    }
+                                } catch (Throwable ignored) {
+                                }
+                            }
+                        });
+                XposedBridge.log("[TT] RuntimeShader hook installed");
+            } else {
+                XposedBridge.log("[TT] RuntimeShader не найден (Android < 13?)");
+            }
+        } catch (Throwable t) {
+            XposedBridge.log("[TT] RuntimeShader hook failed: " + t);
+        }
+
+        // 2. Тонировка также рисуется Canvas.drawColor на RenderNode-канвасе. Он RecordingCanvas,
+        //    а RecordingCanvas переопределяет drawColor, поэтому хука на Canvas.drawColor мало.
+        try {
+            Class<?> brc = XposedHelpers.findClassIfExists("android.graphics.BaseRecordingCanvas", null);
+            if (brc != null) {
+                XposedHelpers.findAndHookMethod(brc, "drawColor", int.class, new XC_MethodHook() {
+                    @Override
+                    protected void beforeHookedMethod(MethodHookParam param) {
+                        try {
+                            int c = (Integer) param.args[0];
+                            int a = Color.alpha(c);
+                            if (!isDarkColor(c)) return;
+                            if (a == 255) {
+                                param.args[0] = WINDOW_BACKGROUND_COLOR;
+                            } else if (GLASS_PATCH_DRAWCOLOR && a > GLASS_DRAWCOLOR_CAP) {
+                                param.args[0] = (c & 0x00FFFFFF) | (GLASS_DRAWCOLOR_CAP << 24);
+                                if (glassLogCount.incrementAndGet() <= 10) {
+                                    XposedBridge.log("[TT] drawColor " + Integer.toHexString(c)
+                                            + " -> " + Integer.toHexString((Integer) param.args[0]));
+                                }
+                            }
+                        } catch (Throwable ignored) {
+                        }
+                    }
+                });
+                XposedBridge.log("[TT] BaseRecordingCanvas.drawColor hook installed");
+            }
+        } catch (Throwable t) {
+            XposedBridge.log("[TT] BaseRecordingCanvas hook failed: " + t);
+        }
+    }
+
+    // =====================================================================
     // Точка входа
     // =====================================================================
 
@@ -519,6 +595,9 @@ public class HookEntry implements IXposedHookLoadPackage {
 
         // ---------- 2b. Фон чата ----------
         hookChatBackground(cl);
+
+        // ---------- 2c. Стекло (шапки/закреп) ----------
+        hookGlass();
 
         // ---------- 3. View.setBackgroundColor / setBackground ----------
         try {
