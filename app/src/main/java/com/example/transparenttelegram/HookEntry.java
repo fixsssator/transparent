@@ -441,6 +441,61 @@ public class HookEntry implements IXposedHookLoadPackage {
         }
     }
 
+    /**
+     * Ищет static int-метод Theme с сигнатурой (float, int) или (int, float) -- в 12.10.6
+     * это i6.l1(F,I)I, alpha-blend хелпер: множит альфу цвета на float-коэффициент.
+     * Стеклянные панели считают итоговый цвет тонировки через
+     * dh.b.d(): i6.v0(key, provider) -> i6.l1(intensity, color) -> кэшируется в поле.
+     * Первый шаг (v0) уже патчится через hookColorMethod, но если intensity > 1 или
+     * если panel-ключ не попал в PANEL_NAMES, результат может остаться тёмным --
+     * поэтому альфа результата l1 дополнительно ограничивается тут же, без знания ключа.
+     */
+    private static Method findAlphaBlendMethod(Class<?> themeClass) {
+        try {
+            for (Method m : themeClass.getDeclaredMethods()) {
+                if (!Modifier.isStatic(m.getModifiers()) || m.getReturnType() != int.class) continue;
+                Class<?>[] p = m.getParameterTypes();
+                if (p.length != 2) continue;
+                if ((p[0] == float.class && p[1] == int.class) || (p[0] == int.class && p[1] == float.class)) {
+                    return m;
+                }
+            }
+        } catch (Throwable t) {
+            XposedBridge.log("[TT] findAlphaBlendMethod failed: " + t);
+        }
+        return null;
+    }
+
+    private void hookAlphaBlendMethod(final Method method) {
+        final String label = method.getDeclaringClass().getName() + "." + method.getName();
+        try {
+            method.setAccessible(true);
+            XposedBridge.hookMethod(method, new XC_MethodHook() {
+                @Override
+                protected void afterHookedMethod(MethodHookParam param) {
+                    try {
+                        Object resultObj = param.getResult();
+                        if (!(resultObj instanceof Integer)) return;
+                        int original = (Integer) resultObj;
+                        int a = Color.alpha(original);
+                        if (a > PANEL_ALPHA && isDarkColor(original)) {
+                            int patched = (original & 0x00FFFFFF) | (PANEL_ALPHA << 24);
+                            param.setResult(patched);
+                            if (glassLogCount.incrementAndGet() <= 20) {
+                                XposedBridge.log("[TT] BLEND " + label + ": "
+                                        + Integer.toHexString(original) + " -> " + Integer.toHexString(patched));
+                            }
+                        }
+                    } catch (Throwable ignored) {
+                    }
+                }
+            });
+            XposedBridge.log("[TT] hooked alpha-blend " + label);
+        } catch (Throwable t) {
+            XposedBridge.log("[TT] hook alpha-blend " + label + " failed: " + t);
+        }
+    }
+
     // =====================================================================
     // Стеклянные панели (liquid glass): шапки, закреп, пузыри в чате
     // =====================================================================
@@ -517,6 +572,33 @@ public class HookEntry implements IXposedHookLoadPackage {
         }
     }
 
+    /**
+     * Крайняя мера, если BLEND/PANEL-хуков всё равно не хватит: полностью отключить
+     * RenderEffect стекла (блюр + тонировка целиком) на уровне RenderNode.setRenderEffect.
+     * Стекло станет плоским, без блюра, но зато гарантированно не тёмным -- этот путь
+     * ничего не знает про ключи тем и не может промахнуться мимо них.
+     * По умолчанию выключено, чтобы не терять блюр без необходимости.
+     */
+    private static final boolean DISABLE_GLASS_RENDER_EFFECT = false;
+
+    private static void hookRenderEffectKillSwitch() {
+        if (!DISABLE_GLASS_RENDER_EFFECT) return;
+        try {
+            Class<?> rn = XposedHelpers.findClassIfExists("android.graphics.RenderNode", null);
+            Class<?> re = XposedHelpers.findClassIfExists("android.graphics.RenderEffect", null);
+            if (rn == null || re == null) return;
+            XposedHelpers.findAndHookMethod(rn, "setRenderEffect", re, new XC_MethodHook() {
+                @Override
+                protected void beforeHookedMethod(MethodHookParam param) {
+                    param.args[0] = null;
+                }
+            });
+            XposedBridge.log("[TT] RenderNode.setRenderEffect kill-switch installed");
+        } catch (Throwable t) {
+            XposedBridge.log("[TT] RenderNode.setRenderEffect kill-switch failed: " + t);
+        }
+    }
+
     // =====================================================================
     // Точка входа
     // =====================================================================
@@ -588,6 +670,13 @@ public class HookEntry implements IXposedHookLoadPackage {
                 for (Method m : getColors) {
                     hookColorMethod(m, firstIntIndex(m.getParameterTypes()));
                 }
+
+                Method blend = findAlphaBlendMethod(themeClass);
+                if (blend != null) {
+                    hookAlphaBlendMethod(blend);
+                } else {
+                    XposedBridge.log("[TT] alpha-blend метод (F,I)I в Theme не найден");
+                }
             }
         } catch (Throwable t) {
             XposedBridge.log("[TT] структурный поиск Theme упал: " + t);
@@ -598,6 +687,7 @@ public class HookEntry implements IXposedHookLoadPackage {
 
         // ---------- 2c. Стекло (шапки/закреп) ----------
         hookGlass();
+        hookRenderEffectKillSwitch();
 
         // ---------- 3. View.setBackgroundColor / setBackground ----------
         try {
@@ -776,6 +866,52 @@ public class HookEntry implements IXposedHookLoadPackage {
         window.addFlags(WindowManager.LayoutParams.FLAG_SHOW_WALLPAPER);
         window.setDimAmount(0f);
         window.setBackgroundDrawable(new ColorDrawable(WINDOW_BACKGROUND_COLOR));
+        clearSystemBarScrims(window);
+    }
+
+    /**
+     * По умолчанию DecorView рисует под статус-баром и навигацией отдельные scrim-View
+     * (android:id/statusBarBackground, android:id/navigationBarBackground) сплошным
+     * полупрозрачным чёрным -- это system-level слой, а не тема Telegram, поэтому
+     * Theme.getColor его никак не видит. Гипотеза: именно он и есть сплошная чёрная
+     * полоса сверху в списке чатов беты (стабильная сборка, видимо, сама вызывает
+     * setStatusBarColor(TRANSPARENT), поэтому там проблемы нет).
+     */
+    private void clearSystemBarScrims(Window window) {
+        try {
+            window.setStatusBarColor(Color.TRANSPARENT);
+        } catch (Throwable ignored) {
+        }
+        try {
+            window.setNavigationBarColor(Color.TRANSPARENT);
+        } catch (Throwable ignored) {
+        }
+    }
+
+    /** android:id/statusBarBackground и android:id/navigationBarBackground -- системные id, стабильны. */
+    private static int sysId(View root, String name) {
+        try {
+            return root.getResources().getIdentifier(name, "id", "android");
+        } catch (Throwable t) {
+            return 0;
+        }
+    }
+
+    private void clearDecorScrimViews(View root) {
+        try {
+            int sbId = sysId(root, "statusBarBackground");
+            int nbId = sysId(root, "navigationBarBackground");
+            if (sbId != 0) {
+                View v = root.findViewById(sbId);
+                if (v != null) v.setBackgroundColor(Color.TRANSPARENT);
+            }
+            if (nbId != 0) {
+                View v = root.findViewById(nbId);
+                if (v != null) v.setBackgroundColor(Color.TRANSPARENT);
+            }
+        } catch (Throwable t) {
+            XposedBridge.log("[TT] clearDecorScrimViews failed: " + t);
+        }
     }
 
     private static final WeakHashMap<View, Boolean> LISTENER_ATTACHED = new WeakHashMap<>();
@@ -792,11 +928,13 @@ public class HookEntry implements IXposedHookLoadPackage {
         window.addFlags(WindowManager.LayoutParams.FLAG_SHOW_WALLPAPER);
         window.setDimAmount(0f);
         window.setBackgroundDrawable(new ColorDrawable(WINDOW_BACKGROUND_COLOR));
+        clearSystemBarScrims(window);
 
         final View root = window.getDecorView();
         if (root == null) {
             return;
         }
+        clearDecorScrimViews(root);
 
         root.post(new Runnable() {
             @Override
@@ -825,6 +963,7 @@ public class HookEntry implements IXposedHookLoadPackage {
 
     private void scanNow(View root) {
         try {
+            clearDecorScrimViews(root);
             stripOpaqueBackgrounds(root, root.getWidth(), root.getHeight(), 0);
         } catch (Throwable t) {
             XposedBridge.log("[TT] stripOpaqueBackgrounds failed: " + t);
