@@ -520,6 +520,7 @@ public class HookEntry implements IXposedHookLoadPackage {
     private static final int GLASS_BLEND_ALPHA_CAP = 0x00;
 
     private static final AtomicInteger glassLogCount = new AtomicInteger(0);
+    private static final AtomicInteger shaderDiagLogCount = new AtomicInteger(0);
 
     private static void hookGlass() {
         // 1. Шейдер стекла принимает цвет тонировки как uniform "foreground_color_premultiplied"
@@ -533,6 +534,11 @@ public class HookEntry implements IXposedHookLoadPackage {
                             @Override
                             protected void beforeHookedMethod(MethodHookParam param) {
                                 try {
+                                    if (shaderDiagLogCount.incrementAndGet() <= 15) {
+                                        XposedBridge.log("[TT][DIAG] RuntimeShader.setFloatUniform(4f) name="
+                                                + param.args[0] + " v=" + param.args[1] + "," + param.args[2]
+                                                + "," + param.args[3] + "," + param.args[4]);
+                                    }
                                     if (!"foreground_color_premultiplied".equals(param.args[0])) return;
                                     for (int i = 1; i <= 4; i++) {
                                         param.args[i] = ((Float) param.args[i]) * GLASS_TINT_SCALE;
@@ -545,6 +551,37 @@ public class HookEntry implements IXposedHookLoadPackage {
                             }
                         });
                 XposedBridge.log("[TT] RuntimeShader hook installed");
+
+                // Диагностика: перехватываем ВСЕ перегрузки setFloatUniform/setColorUniform,
+                // на случай если реальный вызов идёт не через (String,F,F,F,F), как показал
+                // разбор байткода, а через другую сигнатуру (например float[] или setColorUniform).
+                try {
+                    for (Method m : rs.getDeclaredMethods()) {
+                        String mn = m.getName();
+                        if (!mn.equals("setFloatUniform") && !mn.equals("setColorUniform")) continue;
+                        Class<?>[] pt = m.getParameterTypes();
+                        // 4-float overload уже хукнута отдельно выше -- не дублируем.
+                        if (pt.length == 5 && pt[1] == float.class) continue;
+                        m.setAccessible(true);
+                        final String label = mn + Arrays.toString(pt);
+                        XposedBridge.hookMethod(m, new XC_MethodHook() {
+                            @Override
+                            protected void beforeHookedMethod(MethodHookParam param) {
+                                try {
+                                    if (shaderDiagLogCount.incrementAndGet() <= 25) {
+                                        StringBuilder sb = new StringBuilder("[TT][DIAG] RuntimeShader.")
+                                                .append(label).append(" args=");
+                                        for (Object a : param.args) sb.append(a).append(' ');
+                                        XposedBridge.log(sb.toString());
+                                    }
+                                } catch (Throwable ignored) {
+                                }
+                            }
+                        });
+                    }
+                } catch (Throwable t) {
+                    XposedBridge.log("[TT] RuntimeShader diag hooks failed: " + t);
+                }
             } else {
                 XposedBridge.log("[TT] RuntimeShader не найден (Android < 13?)");
             }
@@ -591,7 +628,7 @@ public class HookEntry implements IXposedHookLoadPackage {
      * ничего не знает про ключи тем и не может промахнуться мимо них.
      * По умолчанию выключено, чтобы не терять блюр без необходимости.
      */
-    private static final boolean DISABLE_GLASS_RENDER_EFFECT = false;
+    private static final boolean DISABLE_GLASS_RENDER_EFFECT = true;
 
     private static void hookRenderEffectKillSwitch() {
         if (!DISABLE_GLASS_RENDER_EFFECT) return;
