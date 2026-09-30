@@ -517,7 +517,7 @@ public class HookEntry implements IXposedHookLoadPackage {
      * визуально "почти не видно обоев", хотя в логе каждое отдельное значение выглядит прозрачным.
      * Поэтому здесь нужно заметно меньшее число, чем для панелей, которые рисуются один раз.
      */
-    private static final int GLASS_BLEND_ALPHA_CAP = 0x45;
+    private static final int GLASS_BLEND_ALPHA_CAP = 0x00;
 
     private static final AtomicInteger glassLogCount = new AtomicInteger(0);
 
