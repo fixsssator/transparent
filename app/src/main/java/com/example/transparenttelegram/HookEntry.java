@@ -1030,6 +1030,76 @@ public class HookEntry implements IXposedHookLoadPackage {
     private static final Set<String> loggedTopViewClasses = new HashSet<>();
     private static final Object TOP_LOG_LOCK = new Object();
 
+    /**
+     * Нейтрализация "источника" для блюра у кастомного Drawable-фона стеклянных панелей
+     * (найденного через bg в обходе дерева View). Структурно не зависит от обфусцированных
+     * имён: у такого Drawable находится поле интерфейсного типа (в разборе байткода 12.10.6
+     * это поле было типа Lfh/a; -- аналог BlurredBackgroundSource из открытых имён 12.4.0,
+     * с методом draw(Canvas,float,float,float,float)). Из этого поля берём РЕАЛЬНЫЙ объект-
+     * источник (какая бы под-реализация там ни была) и глушим у его класса метод с такой
+     * сигнатурой -- это и есть то, что блюрится, и что, судя по всему, никогда не содержит
+     * ваши обои (Telegram блюрит собственный захваченный контент, а не системные обои за окном).
+     */
+    private static final Set<Class<?>> neutralizedSourceDrawables = new HashSet<>();
+    private static final Set<Class<?>> neutralizedSourceClasses = new HashSet<>();
+    private static final Object SOURCE_NEUTRALIZE_LOCK = new Object();
+
+    private void neutralizeBlurSource(Drawable bg) {
+        if (bg == null || bg instanceof ColorDrawable) return;
+        Class<?> bgClass = bg.getClass();
+        synchronized (SOURCE_NEUTRALIZE_LOCK) {
+            if (!neutralizedSourceDrawables.add(bgClass)) return;
+        }
+        try {
+            Class<?> c = bgClass;
+            while (c != null && c != Object.class) {
+                for (Field f : c.getDeclaredFields()) {
+                    Class<?> ft = f.getType();
+                    if (!ft.isInterface() || ft.getName().startsWith("java.")) continue;
+                    f.setAccessible(true);
+                    Object source;
+                    try {
+                        source = f.get(bg);
+                    } catch (Throwable ignored) {
+                        continue;
+                    }
+                    if (source == null) continue;
+                    neutralizeDrawMethod(source.getClass(), bgClass.getName() + "." + f.getName());
+                }
+                c = c.getSuperclass();
+            }
+        } catch (Throwable t) {
+            XposedBridge.log("[TT] neutralizeBlurSource failed for " + bgClass.getName() + ": " + t);
+        }
+    }
+
+    private void neutralizeDrawMethod(Class<?> sourceClass, String fieldLabel) {
+        synchronized (SOURCE_NEUTRALIZE_LOCK) {
+            if (!neutralizedSourceClasses.add(sourceClass)) return;
+        }
+        try {
+            for (Method m : sourceClass.getMethods()) {
+                Class<?>[] p = m.getParameterTypes();
+                if (m.getReturnType() != void.class || p.length != 5) continue;
+                if (p[0] != Canvas.class) continue;
+                boolean allFloat = true;
+                for (int i = 1; i < 5; i++) if (p[i] != float.class) { allFloat = false; break; }
+                if (!allFloat) continue;
+                m.setAccessible(true);
+                XposedBridge.hookMethod(m, new XC_MethodHook() {
+                    @Override
+                    protected void beforeHookedMethod(MethodHookParam param) {
+                        param.setResult(null);
+                    }
+                });
+                XposedBridge.log("[TT] neutralized blur source draw: " + sourceClass.getName()
+                        + "." + m.getName() + " (via " + fieldLabel + ")");
+            }
+        } catch (Throwable t) {
+            XposedBridge.log("[TT] neutralizeDrawMethod failed for " + sourceClass.getName() + ": " + t);
+        }
+    }
+
     private void debugLogTopView(View view, Drawable bg, int rootHeight) {
         if (!DEBUG_LOG_TOP_VIEWS) return;
         try {
@@ -1067,6 +1137,7 @@ public class HookEntry implements IXposedHookLoadPackage {
 
         Drawable bg = view.getBackground();
         debugLogTopView(view, bg, rootHeight);
+        neutralizeBlurSource(bg);
 
         if (bg != null && isBlurDrawable(bg)) {
             try {
