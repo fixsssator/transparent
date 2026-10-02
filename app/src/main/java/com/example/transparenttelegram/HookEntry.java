@@ -1040,43 +1040,58 @@ public class HookEntry implements IXposedHookLoadPackage {
      * сигнатурой -- это и есть то, что блюрится, и что, судя по всему, никогда не содержит
      * ваши обои (Telegram блюрит собственный захваченный контент, а не системные обои за окном).
      */
-    private static final Set<Class<?>> neutralizedSourceDrawables = new HashSet<>();
     private static final Set<Class<?>> neutralizedSourceClasses = new HashSet<>();
+    private static final Map<Class<?>, Integer> sourceScanAttempts = new HashMap<>();
+    private static final int MAX_SOURCE_SCAN_ATTEMPTS = 20;
     private static final Object SOURCE_NEUTRALIZE_LOCK = new Object();
 
     private void neutralizeBlurSource(Drawable bg) {
         if (bg == null || bg instanceof ColorDrawable) return;
         Class<?> bgClass = bg.getClass();
         synchronized (SOURCE_NEUTRALIZE_LOCK) {
-            if (!neutralizedSourceDrawables.add(bgClass)) return;
+            if (neutralizedSourceClasses.contains(bgClass)) return;
+            int attempts = sourceScanAttempts.containsKey(bgClass) ? sourceScanAttempts.get(bgClass) : 0;
+            if (attempts >= MAX_SOURCE_SCAN_ATTEMPTS) return;
+            sourceScanAttempts.put(bgClass, attempts + 1);
         }
         try {
+            boolean foundAny = false;
             Class<?> c = bgClass;
             while (c != null && c != Object.class) {
                 for (Field f : c.getDeclaredFields()) {
                     Class<?> ft = f.getType();
-                    if (!ft.isInterface() || ft.getName().startsWith("java.")) continue;
+                    if (ft.isPrimitive() || ft.getName().startsWith("java.")
+                            || ft.getName().startsWith("android.graphics.")
+                            || ft.getName().startsWith("android.util.")) continue;
                     f.setAccessible(true);
-                    Object source;
+                    Object value;
                     try {
-                        source = f.get(bg);
+                        value = f.get(bg);
                     } catch (Throwable ignored) {
                         continue;
                     }
-                    if (source == null) continue;
-                    neutralizeDrawMethod(source.getClass(), bgClass.getName() + "." + f.getName());
+                    if (value == null) continue;
+                    if (neutralizeDrawMethod(value.getClass(), bgClass.getName() + "." + f.getName())) {
+                        foundAny = true;
+                    }
                 }
                 c = c.getSuperclass();
+            }
+            if (foundAny) {
+                synchronized (SOURCE_NEUTRALIZE_LOCK) {
+                    neutralizedSourceClasses.add(bgClass);
+                }
             }
         } catch (Throwable t) {
             XposedBridge.log("[TT] neutralizeBlurSource failed for " + bgClass.getName() + ": " + t);
         }
     }
 
-    private void neutralizeDrawMethod(Class<?> sourceClass, String fieldLabel) {
+    private boolean neutralizeDrawMethod(Class<?> sourceClass, String fieldLabel) {
         synchronized (SOURCE_NEUTRALIZE_LOCK) {
-            if (!neutralizedSourceClasses.add(sourceClass)) return;
+            if (neutralizedSourceClasses.contains(sourceClass)) return true;
         }
+        boolean hookedAny = false;
         try {
             for (Method m : sourceClass.getMethods()) {
                 Class<?>[] p = m.getParameterTypes();
@@ -1094,10 +1109,17 @@ public class HookEntry implements IXposedHookLoadPackage {
                 });
                 XposedBridge.log("[TT] neutralized blur source draw: " + sourceClass.getName()
                         + "." + m.getName() + " (via " + fieldLabel + ")");
+                hookedAny = true;
             }
         } catch (Throwable t) {
             XposedBridge.log("[TT] neutralizeDrawMethod failed for " + sourceClass.getName() + ": " + t);
         }
+        if (hookedAny) {
+            synchronized (SOURCE_NEUTRALIZE_LOCK) {
+                neutralizedSourceClasses.add(sourceClass);
+            }
+        }
+        return hookedAny;
     }
 
     private void debugLogTopView(View view, Drawable bg, int rootHeight) {
