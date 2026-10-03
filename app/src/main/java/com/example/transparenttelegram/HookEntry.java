@@ -524,31 +524,44 @@ public class HookEntry implements IXposedHookLoadPackage {
 
     /**
      * Наш собственный вызов setStatusBarColor(TRANSPARENT) в prepareWindow/applyTransparency --
-     * одноразовый, а Telegram сам перевызывает Window.setStatusBarColor() с цветом из темы
+     * одноразовый, а Telegram сам перевызывает setStatusBarColor() с цветом из темы
      * (actionBarDefault) при каждом обновлении темы/layout, что перетирает наш прозрачный
      * цвет. Поэтому вместо одноразового вызова хукаем сам метод: чем бы его ни вызвали,
-     * подменяем аргумент на прозрачный. Это и есть самая верхняя узкая полоса под часами --
-     * единственное, что в итоге осталось тёмным после фиксов панели стекла.
+     * подменяем аргумент на прозрачный.
+     *
+     * android.view.Window.setStatusBarColor/setNavigationBarColor -- АБСТРАКТНЫЕ методы
+     * (у самого Window нет тела, Xposed не может их хукнуть: "is abstract: it has no body
+     * to hook"). Реальная реализация лежит в конкретном рантайм-подклассе окна (обычно
+     * com.android.internal.policy.PhoneWindow). Поэтому хукаем не Window.class, а
+     * window.getClass() у уже живого объекта окна -- по одному разу на класс.
      */
-    private static void hookStatusBarColor() {
+    private static final Set<Class<?>> statusBarHookedClasses = new HashSet<>();
+    private static final Object STATUS_BAR_HOOK_LOCK = new Object();
+
+    private static void hookStatusBarColor(Window window) {
+        if (window == null) return;
+        Class<?> wc = window.getClass();
+        synchronized (STATUS_BAR_HOOK_LOCK) {
+            if (!statusBarHookedClasses.add(wc)) return;
+        }
         try {
-            XposedHelpers.findAndHookMethod(Window.class, "setStatusBarColor", int.class,
+            XposedHelpers.findAndHookMethod(wc, "setStatusBarColor", int.class,
                     new XC_MethodHook() {
                         @Override
                         protected void beforeHookedMethod(MethodHookParam param) {
                             param.args[0] = Color.TRANSPARENT;
                         }
                     });
-            XposedHelpers.findAndHookMethod(Window.class, "setNavigationBarColor", int.class,
+            XposedHelpers.findAndHookMethod(wc, "setNavigationBarColor", int.class,
                     new XC_MethodHook() {
                         @Override
                         protected void beforeHookedMethod(MethodHookParam param) {
                             param.args[0] = Color.TRANSPARENT;
                         }
                     });
-            XposedBridge.log("[TT] Window.setStatusBarColor/setNavigationBarColor hook installed");
+            XposedBridge.log("[TT] " + wc.getName() + ".setStatusBarColor/setNavigationBarColor hook installed");
         } catch (Throwable t) {
-            XposedBridge.log("[TT] hookStatusBarColor failed: " + t);
+            XposedBridge.log("[TT] hookStatusBarColor failed for " + wc.getName() + ": " + t);
         }
     }
 
@@ -749,13 +762,12 @@ public class HookEntry implements IXposedHookLoadPackage {
                 for (Method m : getColors) {
                     hookColorMethod(m, firstIntIndex(m.getParameterTypes()));
                 }
-
-                Method blend = findAlphaBlendMethod(themeClass);
-                if (blend != null) {
-                    hookAlphaBlendMethod(blend);
-                } else {
-                    XposedBridge.log("[TT] alpha-blend метод (F,I)I в Theme не найден");
-                }
+                // Раньше здесь же патчился общий Theme.changeBrightness (BLEND) -- убрано:
+                // это утилита общего назначения (используется по всему приложению, в т.ч. для
+                // легитимных непрозрачных цветов вроде фона карточек-групп в настройках
+                // AyuGram), и глушить её вслепую было избыточно. Точечная замена --
+                // neutralizeLiquidGlassTint, вызывается из обхода дерева View и бьёт только
+                // по самому объекту "стекла", найденному через живой Drawable-фон.
             }
         } catch (Throwable t) {
             XposedBridge.log("[TT] структурный поиск Theme упал: " + t);
@@ -767,7 +779,6 @@ public class HookEntry implements IXposedHookLoadPackage {
         // ---------- 2c. Стекло (шапки/закреп) ----------
         hookGlass();
         hookRenderEffectKillSwitch();
-        hookStatusBarColor();
 
         // ---------- 3. View.setBackgroundColor / setBackground ----------
         try {
@@ -947,6 +958,7 @@ public class HookEntry implements IXposedHookLoadPackage {
         window.setDimAmount(0f);
         window.setBackgroundDrawable(new ColorDrawable(WINDOW_BACKGROUND_COLOR));
         clearSystemBarScrims(window);
+        hookStatusBarColor(window);
     }
 
     /**
@@ -1009,6 +1021,7 @@ public class HookEntry implements IXposedHookLoadPackage {
         window.setDimAmount(0f);
         window.setBackgroundDrawable(new ColorDrawable(WINDOW_BACKGROUND_COLOR));
         clearSystemBarScrims(window);
+        hookStatusBarColor(window);
 
         final View root = window.getDecorView();
         if (root == null) {
@@ -1102,7 +1115,11 @@ public class HookEntry implements IXposedHookLoadPackage {
                         continue;
                     }
                     if (value == null) continue;
-                    if (neutralizeDrawMethod(value.getClass(), bgClass.getName() + "." + f.getName())) {
+                    String label = bgClass.getName() + "." + f.getName();
+                    if (neutralizeDrawMethod(value.getClass(), label)) {
+                        foundAny = true;
+                    }
+                    if (neutralizeLiquidGlassTint(value.getClass(), label)) {
                         foundAny = true;
                     }
                 }
@@ -1115,6 +1132,72 @@ public class HookEntry implements IXposedHookLoadPackage {
             }
         } catch (Throwable t) {
             XposedBridge.log("[TT] neutralizeBlurSource failed for " + bgClass.getName() + ": " + t);
+        }
+    }
+
+    /**
+     * Точечная замена широкому BLEND-хуку на Theme.changeBrightness (он же l1): та функция
+     * универсальная и используется по всему приложению для десятков целей (в т.ч. для фона
+     * карточек-групп в настройках AyuGram -- "ff1a1c1f", полностью непрозрачный, легитимный
+     * цвет, который BLEND-хук раньше обнулял вслепую, отсюда и серость в настройках). Здесь
+     * же мы нашли объект, который уже через поле известного нам Drawable-фона (ch.e) -- если
+     * у его класса одновременно есть поля RenderEffect, RenderNode И RuntimeShader, это и есть
+     * сам объект "стекла" (LiquidGlassEffect), а не общая утилита. У него ищем метод update
+     * вида (много float, опционально последний int -- цвет тонировки) и зануляем ТОЛЬКО этот
+     * int-параметр -- то есть тушим тонировку именно стекла, не трогая ничего больше в приложении.
+     */
+    private static final Set<Class<?>> neutralizedTintClasses = new HashSet<>();
+
+    private boolean neutralizeLiquidGlassTint(Class<?> candidate, String fieldLabel) {
+        synchronized (SOURCE_NEUTRALIZE_LOCK) {
+            if (neutralizedTintClasses.contains(candidate)) return true;
+        }
+        try {
+            boolean hasRenderEffect = false, hasRenderNode = false, hasRuntimeShader = false;
+            for (Field f : candidate.getDeclaredFields()) {
+                String tn = f.getType().getName();
+                if (tn.equals("android.graphics.RenderEffect")) hasRenderEffect = true;
+                else if (tn.equals("android.graphics.RenderNode")) hasRenderNode = true;
+                else if (tn.equals("android.graphics.RuntimeShader")) hasRuntimeShader = true;
+            }
+            if (!hasRenderEffect || !hasRenderNode || !hasRuntimeShader) return false;
+
+            boolean hookedAny = false;
+            for (Method m : candidate.getDeclaredMethods()) {
+                if (Modifier.isStatic(m.getModifiers()) || m.getReturnType() != void.class) continue;
+                Class<?>[] p = m.getParameterTypes();
+                if (p.length < 8) continue;
+                int floatCount = 0;
+                boolean trailingInt = p[p.length - 1] == int.class;
+                int floatSpan = trailingInt ? p.length - 1 : p.length;
+                boolean allFloat = true;
+                for (int i = 0; i < floatSpan; i++) {
+                    if (p[i] != float.class) { allFloat = false; break; }
+                    floatCount++;
+                }
+                if (!allFloat || floatCount < 7) continue;
+                if (!trailingInt) continue; // нет цветового параметра -- нечего тушить в этой сборке
+                final int colorIdx = p.length - 1;
+                m.setAccessible(true);
+                XposedBridge.hookMethod(m, new XC_MethodHook() {
+                    @Override
+                    protected void beforeHookedMethod(MethodHookParam param) {
+                        param.args[colorIdx] = 0;
+                    }
+                });
+                XposedBridge.log("[TT] neutralized liquid glass tint: " + candidate.getName()
+                        + "." + m.getName() + " (via " + fieldLabel + ")");
+                hookedAny = true;
+            }
+            if (hookedAny) {
+                synchronized (SOURCE_NEUTRALIZE_LOCK) {
+                    neutralizedTintClasses.add(candidate);
+                }
+            }
+            return hookedAny;
+        } catch (Throwable t) {
+            XposedBridge.log("[TT] neutralizeLiquidGlassTint failed for " + candidate.getName() + ": " + t);
+            return false;
         }
     }
 
