@@ -522,6 +522,36 @@ public class HookEntry implements IXposedHookLoadPackage {
     private static final AtomicInteger glassLogCount = new AtomicInteger(0);
     private static final AtomicInteger shaderDiagLogCount = new AtomicInteger(0);
 
+    /**
+     * Наш собственный вызов setStatusBarColor(TRANSPARENT) в prepareWindow/applyTransparency --
+     * одноразовый, а Telegram сам перевызывает Window.setStatusBarColor() с цветом из темы
+     * (actionBarDefault) при каждом обновлении темы/layout, что перетирает наш прозрачный
+     * цвет. Поэтому вместо одноразового вызова хукаем сам метод: чем бы его ни вызвали,
+     * подменяем аргумент на прозрачный. Это и есть самая верхняя узкая полоса под часами --
+     * единственное, что в итоге осталось тёмным после фиксов панели стекла.
+     */
+    private static void hookStatusBarColor() {
+        try {
+            XposedHelpers.findAndHookMethod(Window.class, "setStatusBarColor", int.class,
+                    new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            param.args[0] = Color.TRANSPARENT;
+                        }
+                    });
+            XposedHelpers.findAndHookMethod(Window.class, "setNavigationBarColor", int.class,
+                    new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            param.args[0] = Color.TRANSPARENT;
+                        }
+                    });
+            XposedBridge.log("[TT] Window.setStatusBarColor/setNavigationBarColor hook installed");
+        } catch (Throwable t) {
+            XposedBridge.log("[TT] hookStatusBarColor failed: " + t);
+        }
+    }
+
     private static void hookGlass() {
         // 1. Шейдер стекла принимает цвет тонировки как uniform "foreground_color_premultiplied"
         //    (premultiplied RGBA). Домножение всех четырёх компонент = ослабление альфы тонировки.
@@ -737,6 +767,7 @@ public class HookEntry implements IXposedHookLoadPackage {
         // ---------- 2c. Стекло (шапки/закреп) ----------
         hookGlass();
         hookRenderEffectKillSwitch();
+        hookStatusBarColor();
 
         // ---------- 3. View.setBackgroundColor / setBackground ----------
         try {
