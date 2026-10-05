@@ -517,7 +517,17 @@ public class HookEntry implements IXposedHookLoadPackage {
      * визуально "почти не видно обоев", хотя в логе каждое отдельное значение выглядит прозрачным.
      * Поэтому здесь нужно заметно меньшее число, чем для панелей, которые рисуются один раз.
      */
-    private static final int GLASS_BLEND_ALPHA_CAP = 0x00;
+    /**
+     * Потолок альфы для ОБЩЕГО хука на Theme.changeBrightness (используется по всему
+     * приложению для десятков целей, не только для стекла -- например, для фона карточек-
+     * групп в настройках). Раньше здесь стоял 0x00 (полная невидимость), из-за чего
+     * настройки в AyuGram выглядели неравномерно серыми -- теперь берём тот же умеренный
+     * потолок, что и у панелей (PANEL_ALPHA), чтобы такие элементы становились полупрозрачными
+     * наравне с остальным интерфейсом, а не то невидимыми, то полностью непрозрачными.
+     * Полное обнуление тонировки именно стекла шапки делает отдельный точечный хук
+     * neutralizeLiquidGlassTint -- он не затрагивает карточки настроек.
+     */
+    private static final int GLASS_BLEND_ALPHA_CAP = PANEL_ALPHA;
 
     private static final AtomicInteger glassLogCount = new AtomicInteger(0);
     private static final AtomicInteger shaderDiagLogCount = new AtomicInteger(0);
@@ -545,24 +555,49 @@ public class HookEntry implements IXposedHookLoadPackage {
             if (!statusBarHookedClasses.add(wc)) return;
         }
         try {
-            XposedHelpers.findAndHookMethod(wc, "setStatusBarColor", int.class,
-                    new XC_MethodHook() {
-                        @Override
-                        protected void beforeHookedMethod(MethodHookParam param) {
-                            param.args[0] = Color.TRANSPARENT;
-                        }
-                    });
-            XposedHelpers.findAndHookMethod(wc, "setNavigationBarColor", int.class,
-                    new XC_MethodHook() {
-                        @Override
-                        protected void beforeHookedMethod(MethodHookParam param) {
-                            param.args[0] = Color.TRANSPARENT;
-                        }
-                    });
-            XposedBridge.log("[TT] " + wc.getName() + ".setStatusBarColor/setNavigationBarColor hook installed");
+            boolean ok1 = hookFirstConcreteOverride(wc, "setStatusBarColor");
+            boolean ok2 = hookFirstConcreteOverride(wc, "setNavigationBarColor");
+            if (ok1 || ok2) {
+                XposedBridge.log("[TT] " + wc.getName() + " setStatusBarColor/setNavigationBarColor hook installed");
+            }
         } catch (Throwable t) {
             XposedBridge.log("[TT] hookStatusBarColor failed for " + wc.getName() + ": " + t);
         }
+    }
+
+    /**
+     * Ищем сами, вручную поднимаясь по иерархии от window.getClass(), первый класс, который
+     * РЕАЛЬНО объявляет (getDeclaredMethod, не getMethod) неабстрактную версию метода, и
+     * хукаем его напрямую через XposedBridge.hookMethod. XposedHelpers.findAndHookMethod
+     * иногда резолвит не тот класс (разово ловили ту же "is abstract" ошибку даже после
+     * перехода на window.getClass() -- похоже, getMethod в редких случаях возвращает
+     * Method, формально объявленный на абстрактном Window, если конкретный подкласс метод
+     * не переопределяет напрямую). Ручной обход устойчивее.
+     */
+    private static boolean hookFirstConcreteOverride(Class<?> start, String methodName) {
+        Class<?> c = start;
+        while (c != null && c != Object.class) {
+            try {
+                Method m = c.getDeclaredMethod(methodName, int.class);
+                if (!Modifier.isAbstract(m.getModifiers())) {
+                    m.setAccessible(true);
+                    XposedBridge.hookMethod(m, new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            param.args[0] = Color.TRANSPARENT;
+                        }
+                    });
+                    return true;
+                }
+            } catch (NoSuchMethodException ignored) {
+                // этот класс метод не объявляет -- идём выше
+            } catch (Throwable t) {
+                XposedBridge.log("[TT] hookFirstConcreteOverride(" + methodName + ") failed on "
+                        + c.getName() + ": " + t);
+            }
+            c = c.getSuperclass();
+        }
+        return false;
     }
 
     private static void hookGlass() {
@@ -762,12 +797,17 @@ public class HookEntry implements IXposedHookLoadPackage {
                 for (Method m : getColors) {
                     hookColorMethod(m, firstIntIndex(m.getParameterTypes()));
                 }
-                // Раньше здесь же патчился общий Theme.changeBrightness (BLEND) -- убрано:
-                // это утилита общего назначения (используется по всему приложению, в т.ч. для
-                // легитимных непрозрачных цветов вроде фона карточек-групп в настройках
-                // AyuGram), и глушить её вслепую было избыточно. Точечная замена --
-                // neutralizeLiquidGlassTint, вызывается из обхода дерева View и бьёт только
-                // по самому объекту "стекла", найденному через живой Drawable-фон.
+
+                // Общий Theme.changeBrightness -- теперь с умеренным потолком (см. комментарий
+                // у GLASS_BLEND_ALPHA_CAP), а не с обнулением в ноль. Полное обнуление именно
+                // тонировки стекла шапки делает отдельный точечный хук neutralizeLiquidGlassTint
+                // (вызывается из обхода дерева View, бьёт только по объекту стекла).
+                Method blend = findAlphaBlendMethod(themeClass);
+                if (blend != null) {
+                    hookAlphaBlendMethod(blend);
+                } else {
+                    XposedBridge.log("[TT] alpha-blend метод (F,I)I в Theme не найден");
+                }
             }
         } catch (Throwable t) {
             XposedBridge.log("[TT] структурный поиск Theme упал: " + t);
