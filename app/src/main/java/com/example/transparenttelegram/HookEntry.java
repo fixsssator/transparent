@@ -87,6 +87,14 @@ public class HookEntry implements IXposedHookLoadPackage {
     private static final String SKIP_BG_METHOD = "setSkipBackgroundDrawing";
 
     /**
+     * Версия сборки -- меняйте при каждой правке констант/логики ниже, чтобы в логе Xposed
+     * сразу было видно, какая именно сборка тестируется, без сверки с файлом вручную.
+     * Формат свободный, главное -- чтобы отличалось от предыдущего значения.
+     */
+    private static final String MODULE_VERSION = "v13 (2026-10-05: статус-бар через ручной "
+            + "обход иерархии, GLASS_BLEND_ALPHA_CAP=0x10)";
+
+    /**
      * Общее затемнение: чёрный с этой альфой кладётся на окно и все "залитые" фоны.
      * Было 0x80 (50%) -- отсюда общая темнота. 0x00 = без затемнения, 0xFF = сплошной чёрный.
      */
@@ -527,7 +535,7 @@ public class HookEntry implements IXposedHookLoadPackage {
      * Полное обнуление тонировки именно стекла шапки делает отдельный точечный хук
      * neutralizeLiquidGlassTint -- он не затрагивает карточки настроек.
      */
-    private static final int GLASS_BLEND_ALPHA_CAP = PANEL_ALPHA;
+    private static final int GLASS_BLEND_ALPHA_CAP = 0x10;
 
     private static final AtomicInteger glassLogCount = new AtomicInteger(0);
     private static final AtomicInteger shaderDiagLogCount = new AtomicInteger(0);
@@ -731,6 +739,24 @@ public class HookEntry implements IXposedHookLoadPackage {
     // =====================================================================
 
     @Override
+    /**
+     * Печатает версию сборки и текущие значения всех подстраиваемых констант в лог Xposed
+     * при каждой загрузке пакета. Смотрите строку "[TT] ==== Transparent Telegram ..." в
+     * начале лога, чтобы сразу понять, какая именно сборка и с какими цифрами тестируется.
+     */
+    private static void logVersionBanner(String packageName) {
+        XposedBridge.log("[TT] ==== Transparent Telegram " + MODULE_VERSION + " ====");
+        XposedBridge.log("[TT] Loading: " + packageName);
+        XposedBridge.log("[TT] ALPHA(общий фон)=0x" + Integer.toHexString(ALPHA)
+                + " PANEL_ALPHA(панели)=0x" + Integer.toHexString(PANEL_ALPHA)
+                + " GLASS_BLEND_ALPHA_CAP(changeBrightness)=0x" + Integer.toHexString(GLASS_BLEND_ALPHA_CAP)
+                + " GLASS_DRAWCOLOR_CAP=0x" + Integer.toHexString(GLASS_DRAWCOLOR_CAP)
+                + " BLUR_ALPHA=0x" + Integer.toHexString(BLUR_ALPHA));
+        XposedBridge.log("[TT] DISABLE_GLASS_RENDER_EFFECT=" + DISABLE_GLASS_RENDER_EFFECT
+                + " DEBUG_LOG_TOP_VIEWS=" + DEBUG_LOG_TOP_VIEWS
+                + " GLASS_PATCH_DRAWCOLOR=" + GLASS_PATCH_DRAWCOLOR);
+    }
+
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) {
         if (!TARGET_PACKAGES.contains(lpparam.packageName)) {
             return;
@@ -738,7 +764,7 @@ public class HookEntry implements IXposedHookLoadPackage {
 
         final String packageName = lpparam.packageName;
         final ClassLoader cl = lpparam.classLoader;
-        XposedBridge.log("[TT] Loading: " + packageName);
+        logVersionBanner(packageName);
 
         // ---------- 1. LaunchActivity: окно ----------
         try {
