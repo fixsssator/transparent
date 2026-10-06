@@ -738,7 +738,6 @@ public class HookEntry implements IXposedHookLoadPackage {
     // Точка входа
     // =====================================================================
 
-    @Override
     /**
      * Печатает версию сборки и текущие значения всех подстраиваемых констант в лог Xposed
      * при каждой загрузке пакета. Смотрите строку "[TT] ==== Transparent Telegram ..." в
@@ -757,6 +756,7 @@ public class HookEntry implements IXposedHookLoadPackage {
                 + " GLASS_PATCH_DRAWCOLOR=" + GLASS_PATCH_DRAWCOLOR);
     }
 
+    @Override
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) {
         if (!TARGET_PACKAGES.contains(lpparam.packageName)) {
             return;
