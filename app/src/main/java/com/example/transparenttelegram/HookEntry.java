@@ -15,6 +15,7 @@ import android.view.ViewGroup;
 import android.view.ViewTreeObserver;
 import android.view.Window;
 import android.view.WindowManager;
+import android.widget.AbsListView;
 
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
@@ -28,6 +29,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.WeakHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import dalvik.system.DexFile;
@@ -91,9 +93,11 @@ public class HookEntry implements IXposedHookLoadPackage {
      * сразу было видно, какая именно сборка тестируется, без сверки с файлом вручную.
      * Формат свободный, главное -- чтобы отличалось от предыдущего значения.
      */
-    private static final String MODULE_VERSION = "v15 (2026-10-06: подвисание на новой "
-            + "AyuGram -- дорогая рефлексия (neutralizeBlurSource/Tint) теперь только для "
-            + "View в верхних 20% экрана, DEBUG_LOG_TOP_VIEWS=false, MAX_SOURCE_SCAN_ATTEMPTS=5)";
+    private static final String MODULE_VERSION = "v16 (2026-10-06: подвисание на новой "
+            + "AyuGram -- скан дерева вынесен из onGlobalLayout в один отложенный проход, "
+            + "обработанные Drawable запоминаются (нет повторных mutate/setAlpha), "
+            + "поддеревья RecyclerView пропускаются, потолок MAX_SCAN_NODES, "
+            + "в лог пишутся тайминги сканов)";
 
     /**
      * Диагностический рубильник для нативного SIGSEGV-краша AyuGram (com.exteragram.messenger
@@ -774,6 +778,9 @@ public class HookEntry implements IXposedHookLoadPackage {
                 + " GLASS_PATCH_DRAWCOLOR=" + GLASS_PATCH_DRAWCOLOR
                 + " ENABLE_EARLY_FRAMEWORK_HOOKS=" + ENABLE_EARLY_FRAMEWORK_HOOKS
                 + " MAX_SOURCE_SCAN_ATTEMPTS=" + MAX_SOURCE_SCAN_ATTEMPTS);
+        XposedBridge.log("[TT] SCAN_THROTTLE_MS=" + SCAN_THROTTLE_MS
+                + " MAX_SCAN_NODES=" + MAX_SCAN_NODES
+                + " SKIP_RECYCLER_SUBTREES=" + SKIP_RECYCLER_SUBTREES);
     }
 
     @Override
@@ -1098,8 +1105,42 @@ public class HookEntry implements IXposedHookLoadPackage {
     }
 
     private static final WeakHashMap<View, Boolean> LISTENER_ATTACHED = new WeakHashMap<>();
-    private static volatile long lastScanTime = 0L;
-    private static final long SCAN_THROTTLE_MS = 400L;
+
+    /**
+     * Задержка перед отложенным проходом по дереву. Скан больше НЕ выполняется внутри
+     * onGlobalLayout: слушатель лишь ставит один (коалесцированный) отложенный проход, так что
+     * наши же setBackgroundColor/setAlpha -> новая перекладка -> новый скан не превращаются
+     * в самоподдерживающийся цикл на UI-потоке.
+     */
+    private static final long SCAN_THROTTLE_MS = 600L;
+
+    /** Жёсткий потолок числа View за один проход (защита от гигантских деревьев). */
+    private static final int MAX_SCAN_NODES = 4000;
+
+    /**
+     * Не заходить внутрь RecyclerView/AbsListView: полноэкранных фонов и стеклянных панелей
+     * в ячейках списков нет, а самих ячеек тысячи -- именно они раздували обход.
+     */
+    private static final boolean SKIP_RECYCLER_SUBTREES = true;
+
+    private static final AtomicBoolean scanScheduled = new AtomicBoolean(false);
+    private static volatile boolean scanning = false;
+    private static final AtomicInteger scanCounter = new AtomicInteger(0);
+
+    /** Счётчики текущего прохода (только UI-поток, внутри scanNow). */
+    private int scanNodes = 0;
+    private int scanChanges = 0;
+    private boolean scanCapHit = false;
+
+    /**
+     * Drawable, которые мы уже обработали (по идентичности экземпляра). Повторный проход по
+     * ним не делает ни mutate(), ни setAlpha(), а значит ничего не инвалидирует.
+     */
+    private static final WeakHashMap<Drawable, Boolean> ALPHA_APPLIED = new WeakHashMap<>();
+    /** Drawable, для которых neutralizeBlurSource уже запускался. */
+    private static final WeakHashMap<Drawable, Boolean> NEUTRALIZE_SEEN = new WeakHashMap<>();
+    private static final Object MEMO_LOCK = new Object();
+    private static final Map<Class<?>, Boolean> recyclerClassCache = new HashMap<>();
 
     private void applyTransparency(final Activity activity) {
         if (activity == null || activity.isFinishing()) {
@@ -1120,12 +1161,7 @@ public class HookEntry implements IXposedHookLoadPackage {
         }
         clearDecorScrimViews(root);
 
-        root.post(new Runnable() {
-            @Override
-            public void run() {
-                scanNow(root);
-            }
-        });
+        scheduleScan(root);
 
         synchronized (LISTENER_ATTACHED) {
             if (!Boolean.TRUE.equals(LISTENER_ATTACHED.get(root))) {
@@ -1134,23 +1170,52 @@ public class HookEntry implements IXposedHookLoadPackage {
                         new ViewTreeObserver.OnGlobalLayoutListener() {
                             @Override
                             public void onGlobalLayout() {
-                                long now = System.currentTimeMillis();
-                                if (now - lastScanTime >= SCAN_THROTTLE_MS) {
-                                    lastScanTime = now;
-                                    scanNow(root);
-                                }
+                                // Только планируем; сам обход -- позже и один на пачку перекладок.
+                                scheduleScan(root);
                             }
                         });
             }
         }
     }
 
+    /** Ставит ровно один отложенный проход; пока он не выполнился, новые запросы игнорируются. */
+    private void scheduleScan(final View root) {
+        if (scanning) return;
+        if (!scanScheduled.compareAndSet(false, true)) return;
+        try {
+            root.postDelayed(new Runnable() {
+                @Override
+                public void run() {
+                    scanScheduled.set(false);
+                    scanNow(root);
+                }
+            }, SCAN_THROTTLE_MS);
+        } catch (Throwable t) {
+            scanScheduled.set(false);
+            XposedBridge.log("[TT] scheduleScan failed: " + t);
+        }
+    }
+
     private void scanNow(View root) {
+        if (scanning) return;
+        scanning = true;
+        long t0 = System.nanoTime();
+        scanNodes = 0;
+        scanChanges = 0;
+        scanCapHit = false;
         try {
             clearDecorScrimViews(root);
             stripOpaqueBackgrounds(root, root.getWidth(), root.getHeight(), 0);
         } catch (Throwable t) {
             XposedBridge.log("[TT] stripOpaqueBackgrounds failed: " + t);
+        } finally {
+            scanning = false;
+            long ms = (System.nanoTime() - t0) / 1000000L;
+            int n = scanCounter.incrementAndGet();
+            if (n <= 10 || ms > 16 || scanCapHit) {
+                XposedBridge.log("[TT] scan #" + n + ": nodes=" + scanNodes + " changed=" + scanChanges
+                        + " ms=" + ms + (scanCapHit ? " (достигнут MAX_SCAN_NODES)" : ""));
+            }
         }
     }
 
@@ -1182,6 +1247,11 @@ public class HookEntry implements IXposedHookLoadPackage {
 
     private void neutralizeBlurSource(Drawable bg) {
         if (bg == null || bg instanceof ColorDrawable) return;
+        // Один и тот же экземпляр Drawable повторно не разбираем рефлексией.
+        synchronized (MEMO_LOCK) {
+            if (NEUTRALIZE_SEEN.containsKey(bg)) return;
+            NEUTRALIZE_SEEN.put(bg, Boolean.TRUE);
+        }
         Class<?> bgClass = bg.getClass();
         synchronized (SOURCE_NEUTRALIZE_LOCK) {
             if (neutralizedSourceClasses.contains(bgClass)) return;
@@ -1357,25 +1427,68 @@ public class HookEntry implements IXposedHookLoadPackage {
         }
     }
 
+    /** true, если View -- RecyclerView/AbsListView (по иерархии классов, с кэшем). */
+    private static boolean isRecyclerLike(View view) {
+        if (view instanceof AbsListView) return true;
+        Class<?> vc = view.getClass();
+        synchronized (MEMO_LOCK) {
+            Boolean cached = recyclerClassCache.get(vc);
+            if (cached != null) return cached;
+        }
+        boolean result = false;
+        Class<?> c = vc;
+        while (c != null && c != View.class && c != Object.class) {
+            String n = c.getName();
+            if (n.contains("RecyclerView") || n.contains("RecyclerListView")) {
+                result = true;
+                break;
+            }
+            c = c.getSuperclass();
+        }
+        synchronized (MEMO_LOCK) {
+            recyclerClassCache.put(vc, result);
+        }
+        return result;
+    }
+
+    private boolean alreadyApplied(Drawable d) {
+        synchronized (MEMO_LOCK) {
+            return ALPHA_APPLIED.containsKey(d);
+        }
+    }
+
+    private void markApplied(Drawable d) {
+        synchronized (MEMO_LOCK) {
+            ALPHA_APPLIED.put(d, Boolean.TRUE);
+        }
+    }
+
     private void stripOpaqueBackgrounds(View view, int rootWidth, int rootHeight, int depth) {
         if (view == null || depth > 40) {
             return;
         }
+        if (scanNodes >= MAX_SCAN_NODES) {
+            scanCapHit = true;
+            return;
+        }
+        scanNodes++;
 
         Drawable bg = view.getBackground();
         debugLogTopView(view, bg, rootHeight);
-        // Раньше гонялось на КАЖДОМ View всего дерева на каждую перекладку -- на тяжёлых
-        // сборках (много кастомных классов, например новая AyuGram) это заметно тормозило
-        // UI-поток вплоть до подвисаний. Стеклянные панели всегда у верхнего края экрана,
-        // так что дорогую рефлексию имеет смысл гонять только там же, где и диагностику.
-        if (view.getTop() <= rootHeight * 0.20f) {
+        // Стеклянные панели всегда у верхнего края экрана, так что дорогую рефлексию гоняем
+        // только там (и один раз на экземпляр Drawable -- см. NEUTRALIZE_SEEN).
+        if (bg != null && view.getTop() <= rootHeight * 0.20f) {
             neutralizeBlurSource(bg);
         }
 
         if (bg != null && isBlurDrawable(bg)) {
-            try {
-                bg.mutate().setAlpha(BLUR_ALPHA);
-            } catch (Throwable ignored) {
+            if (!alreadyApplied(bg)) {
+                try {
+                    bg.mutate().setAlpha(BLUR_ALPHA);
+                    markApplied(bg);
+                    scanChanges++;
+                } catch (Throwable ignored) {
+                }
             }
         } else if (bg != null && isEffectivelyOpaque(bg)) {
             boolean fullWidth = view.getWidth() >= rootWidth * 0.85f;
@@ -1384,8 +1497,11 @@ public class HookEntry implements IXposedHookLoadPackage {
                 try {
                     if (bg instanceof ColorDrawable) {
                         view.setBackgroundColor(WINDOW_BACKGROUND_COLOR);
-                    } else {
+                        scanChanges++;
+                    } else if (!alreadyApplied(bg)) {
                         bg.mutate().setAlpha(ALPHA);
+                        markApplied(bg);
+                        scanChanges++;
                     }
                 } catch (Throwable ignored) {
                 }
@@ -1393,6 +1509,9 @@ public class HookEntry implements IXposedHookLoadPackage {
         }
 
         if (view instanceof ViewGroup) {
+            if (SKIP_RECYCLER_SUBTREES && isRecyclerLike(view)) {
+                return;
+            }
             ViewGroup group = (ViewGroup) view;
             int count = group.getChildCount();
             for (int i = 0; i < count; i++) {
