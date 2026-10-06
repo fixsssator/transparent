@@ -91,8 +91,26 @@ public class HookEntry implements IXposedHookLoadPackage {
      * сразу было видно, какая именно сборка тестируется, без сверки с файлом вручную.
      * Формат свободный, главное -- чтобы отличалось от предыдущего значения.
      */
-    private static final String MODULE_VERSION = "v13 (2026-10-05: статус-бар через ручной "
-            + "обход иерархии, GLASS_BLEND_ALPHA_CAP=0x10)";
+    private static final String MODULE_VERSION = "v15 (2026-10-06: подвисание на новой "
+            + "AyuGram -- дорогая рефлексия (neutralizeBlurSource/Tint) теперь только для "
+            + "View в верхних 20% экрана, DEBUG_LOG_TOP_VIEWS=false, MAX_SOURCE_SCAN_ATTEMPTS=5)";
+
+    /**
+     * Диагностический рубильник для нативного SIGSEGV-краша AyuGram (com.exteragram.messenger
+     * .plugins.PluginsController.applyBlacklist, детерминированный адрес сбоя во всех попытках).
+     * Краш происходит УЖЕ ПОСЛЕ того, как handleLoadPackage отрабатывает полностью без
+     * исключений -- то есть не в нашей Java-логике напрямую, а где-то в рантайм-состоянии
+     * ART/хуков, с которым потом сталкивается код самого AyuGram. На бете и стабильной (те же
+     * хуки, тот же лог) краша нет -- значит, дело в чём-то, что пересекается именно со
+     * структурой классов AyuGram. false здесь отключает самые новые и самые "системные" хуки
+     * (RuntimeShader/RenderNode/BaseRecordingCanvas из hookGlass()/hookRenderEffectKillSwitch())
+     * -- именно они трогают низкоуровневые графические классы платформы, а не только классы
+     * самого Telegram. Если после этого AyuGram перестанет падать -- причина локализована
+     * именно в них, и дальше можно включать по одному хуку, чтобы найти виновника точнее.
+     * Если упадёт всё равно -- дело не в HookEntry.java вообще (стоит проверить без TeleVip
+     * и/или сообщить баг самим разработчикам AyuGram, раз крашится их PluginsController).
+     */
+    private static final boolean ENABLE_EARLY_FRAMEWORK_HOOKS = false;
 
     /**
      * Общее затемнение: чёрный с этой альфой кладётся на окно и все "залитые" фоны.
@@ -753,7 +771,9 @@ public class HookEntry implements IXposedHookLoadPackage {
                 + " BLUR_ALPHA=0x" + Integer.toHexString(BLUR_ALPHA));
         XposedBridge.log("[TT] DISABLE_GLASS_RENDER_EFFECT=" + DISABLE_GLASS_RENDER_EFFECT
                 + " DEBUG_LOG_TOP_VIEWS=" + DEBUG_LOG_TOP_VIEWS
-                + " GLASS_PATCH_DRAWCOLOR=" + GLASS_PATCH_DRAWCOLOR);
+                + " GLASS_PATCH_DRAWCOLOR=" + GLASS_PATCH_DRAWCOLOR
+                + " ENABLE_EARLY_FRAMEWORK_HOOKS=" + ENABLE_EARLY_FRAMEWORK_HOOKS
+                + " MAX_SOURCE_SCAN_ATTEMPTS=" + MAX_SOURCE_SCAN_ATTEMPTS);
     }
 
     @Override
@@ -843,8 +863,13 @@ public class HookEntry implements IXposedHookLoadPackage {
         hookChatBackground(cl);
 
         // ---------- 2c. Стекло (шапки/закреп) ----------
-        hookGlass();
-        hookRenderEffectKillSwitch();
+        if (ENABLE_EARLY_FRAMEWORK_HOOKS) {
+            hookGlass();
+            hookRenderEffectKillSwitch();
+        } else {
+            XposedBridge.log("[TT] ENABLE_EARLY_FRAMEWORK_HOOKS=false -- RuntimeShader/RenderNode/"
+                    + "BaseRecordingCanvas хуки пропущены (диагностика нативного краша AyuGram)");
+        }
 
         // ---------- 3. View.setBackgroundColor / setBackground ----------
         try {
@@ -1136,7 +1161,7 @@ public class HookEntry implements IXposedHookLoadPackage {
      * View в верхних ~20% экрана (по одному разу на класс), чтобы увидеть в логе Xposed,
      * что там на самом деле рисуется.
      */
-    private static final boolean DEBUG_LOG_TOP_VIEWS = true;
+    private static final boolean DEBUG_LOG_TOP_VIEWS = false;
     private static final Set<String> loggedTopViewClasses = new HashSet<>();
     private static final Object TOP_LOG_LOCK = new Object();
 
@@ -1152,7 +1177,7 @@ public class HookEntry implements IXposedHookLoadPackage {
      */
     private static final Set<Class<?>> neutralizedSourceClasses = new HashSet<>();
     private static final Map<Class<?>, Integer> sourceScanAttempts = new HashMap<>();
-    private static final int MAX_SOURCE_SCAN_ATTEMPTS = 20;
+    private static final int MAX_SOURCE_SCAN_ATTEMPTS = 5;
     private static final Object SOURCE_NEUTRALIZE_LOCK = new Object();
 
     private void neutralizeBlurSource(Drawable bg) {
@@ -1339,7 +1364,13 @@ public class HookEntry implements IXposedHookLoadPackage {
 
         Drawable bg = view.getBackground();
         debugLogTopView(view, bg, rootHeight);
-        neutralizeBlurSource(bg);
+        // Раньше гонялось на КАЖДОМ View всего дерева на каждую перекладку -- на тяжёлых
+        // сборках (много кастомных классов, например новая AyuGram) это заметно тормозило
+        // UI-поток вплоть до подвисаний. Стеклянные панели всегда у верхнего края экрана,
+        // так что дорогую рефлексию имеет смысл гонять только там же, где и диагностику.
+        if (view.getTop() <= rootHeight * 0.20f) {
+            neutralizeBlurSource(bg);
+        }
 
         if (bg != null && isBlurDrawable(bg)) {
             try {
