@@ -9,15 +9,12 @@ import android.graphics.RectF;
 import android.graphics.drawable.ColorDrawable;
 import android.graphics.drawable.Drawable;
 import android.os.Bundle;
-import android.os.Handler;
-import android.os.Looper;
 import android.util.SparseArray;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.ViewTreeObserver;
 import android.view.Window;
 import android.view.WindowManager;
-import android.widget.AbsListView;
 
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
@@ -31,7 +28,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.WeakHashMap;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import dalvik.system.DexFile;
@@ -95,10 +91,9 @@ public class HookEntry implements IXposedHookLoadPackage {
      * сразу было видно, какая именно сборка тестируется, без сверки с файлом вручную.
      * Формат свободный, главное -- чтобы отличалось от предыдущего значения.
      */
-    private static final String MODULE_VERSION = "v17 (2026-10-06: зависание на AyuGram -- "
-            + "watchdog главного потока (стек в лог при зависании), resolveKeys без блокирующего "
-            + "лока (CAS, нет дедлока на <clinit>), тяжёлая рефлексия neutralizeBlurSource "
-            + "выключена флагом ENABLE_BLUR_NEUTRALIZE=false, флаг ENABLE_TREE_SCAN)";
+    private static final String MODULE_VERSION = "v17 (2026-10-06: зависание ушло после очистки "
+            + "данных AyuGram, не было связано с хуками -- ENABLE_EARLY_FRAMEWORK_HOOKS=true "
+            + "снова включён, иначе шапка тёмная без RenderNode kill-switch)";
 
     /**
      * Диагностический рубильник для нативного SIGSEGV-краша AyuGram (com.exteragram.messenger
@@ -115,27 +110,7 @@ public class HookEntry implements IXposedHookLoadPackage {
      * Если упадёт всё равно -- дело не в HookEntry.java вообще (стоит проверить без TeleVip
      * и/или сообщить баг самим разработчикам AyuGram, раз крашится их PluginsController).
      */
-    private static final boolean ENABLE_EARLY_FRAMEWORK_HOOKS = false;
-
-    /**
-     * Watchdog: фоновый поток пингует главный Looper; если UI не отвечает дольше
-     * WATCHDOG_TIMEOUT_MS, в лог Xposed пишется стек главного потока (и стеки BLOCKED-потоков).
-     * По строкам "[TT][WATCHDOG]" видно, где именно висит UI.
-     */
-    private static final boolean ENABLE_WATCHDOG = true;
-    private static final long WATCHDOG_TIMEOUT_MS = 2000L;
-    private static final int WATCHDOG_MAX_DUMPS = 4;
-
-    /** false -- полностью отключить обход дерева View (для бисекции зависания). */
-    private static final boolean ENABLE_TREE_SCAN = true;
-
-    /**
-     * false -- не гонять в скане рефлексию + рантайм-хуки neutralizeBlurSource/
-     * neutralizeLiquidGlassTint. Это самая тяжёлая и непредсказуемая часть (хукает методы
-     * произвольных классов, найденных через поля Drawable). Если при false зависание уходит --
-     * виновник найден; тогда стеклянная шапка может остаться тёмной.
-     */
-    private static final boolean ENABLE_BLUR_NEUTRALIZE = false;
+    private static final boolean ENABLE_EARLY_FRAMEWORK_HOOKS = true;
 
     /**
      * Общее затемнение: чёрный с этой альфой кладётся на окно и все "залитые" фоны.
@@ -187,102 +162,11 @@ public class HookEntry implements IXposedHookLoadPackage {
     private static volatile Set<Integer> textKeys = null;
     private static volatile Set<Integer> panelKeys = null;
     private static volatile Map<Integer, String> keyNamesByValue = null;
+    private static final Object KEYS_LOCK = new Object();
     private static volatile boolean keysResolveFailed = false;
-
-    /** Неблокирующий флаг "кто-то уже разрешает ключи" (вместо synchronized -- см. resolveKeys). */
-    private static final AtomicBoolean resolveInProgress = new AtomicBoolean(false);
+    private static volatile boolean resolving = false;
 
     private static final AtomicInteger getColorPatchLogCount = new AtomicInteger(0);
-
-    // =====================================================================
-    // Watchdog главного потока
-    // =====================================================================
-
-    private static final AtomicBoolean watchdogStarted = new AtomicBoolean(false);
-
-    private static void startWatchdog() {
-        if (!ENABLE_WATCHDOG) return;
-        if (!watchdogStarted.compareAndSet(false, true)) return;
-        try {
-            Thread t = new Thread(new Runnable() {
-                @Override
-                public void run() {
-                    Handler h = new Handler(Looper.getMainLooper());
-                    int dumps = 0;
-                    while (true) {
-                        final AtomicBoolean ponged = new AtomicBoolean(false);
-                        h.post(new Runnable() {
-                            @Override
-                            public void run() {
-                                ponged.set(true);
-                            }
-                        });
-                        try {
-                            Thread.sleep(WATCHDOG_TIMEOUT_MS);
-                        } catch (InterruptedException e) {
-                            return;
-                        }
-                        if (ponged.get()) {
-                            try {
-                                Thread.sleep(1000L);
-                            } catch (InterruptedException e) {
-                                return;
-                            }
-                            continue;
-                        }
-                        // Главный поток не ответил за WATCHDOG_TIMEOUT_MS.
-                        long blockedSince = System.currentTimeMillis() - WATCHDOG_TIMEOUT_MS;
-                        while (!ponged.get()) {
-                            if (dumps < WATCHDOG_MAX_DUMPS) {
-                                dumps++;
-                                dumpThreads(System.currentTimeMillis() - blockedSince);
-                            }
-                            for (int i = 0; i < 6 && !ponged.get(); i++) {
-                                try {
-                                    Thread.sleep(500L);
-                                } catch (InterruptedException e) {
-                                    return;
-                                }
-                            }
-                        }
-                        XposedBridge.log("[TT][WATCHDOG] UI-поток снова отвечает (завис ~"
-                                + (System.currentTimeMillis() - blockedSince) + " мс)");
-                    }
-                }
-            }, "TT-watchdog");
-            t.setDaemon(true);
-            t.start();
-            XposedBridge.log("[TT] watchdog started (timeout=" + WATCHDOG_TIMEOUT_MS + " мс)");
-        } catch (Throwable t) {
-            XposedBridge.log("[TT] watchdog start failed: " + t);
-        }
-    }
-
-    private static void dumpThreads(long blockedMs) {
-        try {
-            Thread main = Looper.getMainLooper().getThread();
-            XposedBridge.log("[TT][WATCHDOG] UI-поток не отвечает ~" + blockedMs + " мс, state="
-                    + main.getState());
-            StackTraceElement[] st = main.getStackTrace();
-            int n = Math.min(st.length, 40);
-            for (int i = 0; i < n; i++) {
-                XposedBridge.log("[TT][WATCHDOG] main #" + i + " " + st[i]);
-            }
-            for (Map.Entry<Thread, StackTraceElement[]> e : Thread.getAllStackTraces().entrySet()) {
-                Thread th = e.getKey();
-                if (th == main) continue;
-                if (th.getState() != Thread.State.BLOCKED) continue;
-                XposedBridge.log("[TT][WATCHDOG] BLOCKED thread '" + th.getName() + "'");
-                StackTraceElement[] ts = e.getValue();
-                int m = Math.min(ts.length, 15);
-                for (int i = 0; i < m; i++) {
-                    XposedBridge.log("[TT][WATCHDOG]   " + th.getName() + " #" + i + " " + ts[i]);
-                }
-            }
-        } catch (Throwable t) {
-            XposedBridge.log("[TT][WATCHDOG] dump failed: " + t);
-        }
-    }
 
     // =====================================================================
     // Структурный поиск
@@ -442,71 +326,66 @@ public class HookEntry implements IXposedHookLoadPackage {
     /**
      * Ленивое разрешение ключей. Только изнутри сработавшего хука getColor:
      * к этому моменту Theme уже инициализирован.
-     *
-     * ВАЖНО: раньше здесь был synchronized, а внутри через рефлексию вызывались статические
-     * методы классов Telegram (то есть могла запускаться их <clinit>). Если другой поток в этот
-     * момент сидел внутри <clinit> и дёрнул getColor -> наш хук -> synchronized, получался
-     * классический дедлок "лок против инициализации класса". Теперь лок неблокирующий (CAS):
-     * кто не успел занять флаг -- просто выходит и работает без патча до следующего вызова.
      */
     private static void resolveKeys() {
-        if (backgroundKeys != null || keysResolveFailed) return;
-        if (!resolveInProgress.compareAndSet(false, true)) return;
-        try {
-            if (backgroundKeys != null || keysResolveFailed) return;
-
-            List<Class<?>> classes = uiClasses;
-            if (classes == null) {
-                keysResolveFailed = true;
-                return;
-            }
-            Map<String, Integer> nameToKey = findNameToKeyMap(classes);
-            if (nameToKey == null) {
-                keysResolveFailed = true;
-                XposedBridge.log("[TT] карта ключей не найдена -- getColor-хук не будет патчить цвета. "
-                        + "View/Canvas-хуки работают как обычно.");
-                return;
-            }
-
-            Set<Integer> bg = new HashSet<>();
-            Set<Integer> txt = new HashSet<>();
-            Set<Integer> pnl = new HashSet<>();
-            Map<Integer, String> names = new HashMap<>();
-
-            for (String n : BG_NAMES) {
-                Integer k = nameToKey.get(n);
-                if (k != null) {
-                    bg.add(k);
-                    names.put(k, n);
+        if (backgroundKeys != null || keysResolveFailed || resolving) return;
+        synchronized (KEYS_LOCK) {
+            if (backgroundKeys != null || keysResolveFailed || resolving) return;
+            resolving = true;
+            try {
+                List<Class<?>> classes = uiClasses;
+                if (classes == null) {
+                    keysResolveFailed = true;
+                    return;
                 }
-            }
-            for (String n : TEXT_NAMES) {
-                Integer k = nameToKey.get(n);
-                if (k != null) {
-                    txt.add(k);
-                    names.put(k, n);
+                Map<String, Integer> nameToKey = findNameToKeyMap(classes);
+                if (nameToKey == null) {
+                    keysResolveFailed = true;
+                    XposedBridge.log("[TT] карта ключей не найдена -- getColor-хук не будет патчить цвета. "
+                            + "View/Canvas-хуки работают как обычно.");
+                    return;
                 }
-            }
-            for (String n : PANEL_NAMES) {
-                Integer k = nameToKey.get(n);
-                if (k != null && !bg.contains(k)) {
-                    pnl.add(k);
-                    names.put(k, n);
+
+                Set<Integer> bg = new HashSet<>();
+                Set<Integer> txt = new HashSet<>();
+                Set<Integer> pnl = new HashSet<>();
+                Map<Integer, String> names = new HashMap<>();
+
+                for (String n : BG_NAMES) {
+                    Integer k = nameToKey.get(n);
+                    if (k != null) {
+                        bg.add(k);
+                        names.put(k, n);
+                    }
                 }
+                for (String n : TEXT_NAMES) {
+                    Integer k = nameToKey.get(n);
+                    if (k != null) {
+                        txt.add(k);
+                        names.put(k, n);
+                    }
+                }
+                for (String n : PANEL_NAMES) {
+                    Integer k = nameToKey.get(n);
+                    if (k != null && !bg.contains(k)) {
+                        pnl.add(k);
+                        names.put(k, n);
+                    }
+                }
+                if (bg.isEmpty() && txt.isEmpty() && pnl.isEmpty()) {
+                    keysResolveFailed = true;
+                    XposedBridge.log("[TT] нужные имена ключей не найдены в карте");
+                    return;
+                }
+                keyNamesByValue = names;
+                textKeys = txt;
+                panelKeys = pnl;
+                backgroundKeys = bg; // последним: по нему проверяется готовность
+                XposedBridge.log("[TT] ключи разрешены: bg=" + bg.size() + ", text=" + txt.size()
+                        + ", panel=" + pnl.size());
+            } finally {
+                resolving = false;
             }
-            if (bg.isEmpty() && txt.isEmpty() && pnl.isEmpty()) {
-                keysResolveFailed = true;
-                XposedBridge.log("[TT] нужные имена ключей не найдены в карте");
-                return;
-            }
-            keyNamesByValue = names;
-            textKeys = txt;
-            panelKeys = pnl;
-            backgroundKeys = bg; // последним: по нему проверяется готовность
-            XposedBridge.log("[TT] ключи разрешены: bg=" + bg.size() + ", text=" + txt.size()
-                    + ", panel=" + pnl.size());
-        } finally {
-            resolveInProgress.set(false);
         }
     }
 
@@ -895,12 +774,6 @@ public class HookEntry implements IXposedHookLoadPackage {
                 + " GLASS_PATCH_DRAWCOLOR=" + GLASS_PATCH_DRAWCOLOR
                 + " ENABLE_EARLY_FRAMEWORK_HOOKS=" + ENABLE_EARLY_FRAMEWORK_HOOKS
                 + " MAX_SOURCE_SCAN_ATTEMPTS=" + MAX_SOURCE_SCAN_ATTEMPTS);
-        XposedBridge.log("[TT] SCAN_THROTTLE_MS=" + SCAN_THROTTLE_MS
-                + " MAX_SCAN_NODES=" + MAX_SCAN_NODES
-                + " SKIP_RECYCLER_SUBTREES=" + SKIP_RECYCLER_SUBTREES
-                + " ENABLE_TREE_SCAN=" + ENABLE_TREE_SCAN
-                + " ENABLE_BLUR_NEUTRALIZE=" + ENABLE_BLUR_NEUTRALIZE
-                + " ENABLE_WATCHDOG=" + ENABLE_WATCHDOG);
     }
 
     @Override
@@ -912,7 +785,6 @@ public class HookEntry implements IXposedHookLoadPackage {
         final String packageName = lpparam.packageName;
         final ClassLoader cl = lpparam.classLoader;
         logVersionBanner(packageName);
-        startWatchdog();
 
         // ---------- 1. LaunchActivity: окно ----------
         try {
@@ -1226,42 +1098,8 @@ public class HookEntry implements IXposedHookLoadPackage {
     }
 
     private static final WeakHashMap<View, Boolean> LISTENER_ATTACHED = new WeakHashMap<>();
-
-    /**
-     * Задержка перед отложенным проходом по дереву. Скан НЕ выполняется внутри
-     * onGlobalLayout: слушатель лишь ставит один (коалесцированный) отложенный проход, так что
-     * наши же setBackgroundColor/setAlpha -> новая перекладка -> новый скан не превращаются
-     * в самоподдерживающийся цикл на UI-потоке.
-     */
-    private static final long SCAN_THROTTLE_MS = 600L;
-
-    /** Жёсткий потолок числа View за один проход (защита от гигантских деревьев). */
-    private static final int MAX_SCAN_NODES = 4000;
-
-    /**
-     * Не заходить внутрь RecyclerView/AbsListView: полноэкранных фонов и стеклянных панелей
-     * в ячейках списков нет, а самих ячеек тысячи -- именно они раздували обход.
-     */
-    private static final boolean SKIP_RECYCLER_SUBTREES = true;
-
-    private static final AtomicBoolean scanScheduled = new AtomicBoolean(false);
-    private static volatile boolean scanning = false;
-    private static final AtomicInteger scanCounter = new AtomicInteger(0);
-
-    /** Счётчики текущего прохода (только UI-поток, внутри scanNow). */
-    private int scanNodes = 0;
-    private int scanChanges = 0;
-    private boolean scanCapHit = false;
-
-    /**
-     * Drawable, которые мы уже обработали (по идентичности экземпляра). Повторный проход по
-     * ним не делает ни mutate(), ни setAlpha(), а значит ничего не инвалидирует.
-     */
-    private static final WeakHashMap<Drawable, Boolean> ALPHA_APPLIED = new WeakHashMap<>();
-    /** Drawable, для которых neutralizeBlurSource уже запускался. */
-    private static final WeakHashMap<Drawable, Boolean> NEUTRALIZE_SEEN = new WeakHashMap<>();
-    private static final Object MEMO_LOCK = new Object();
-    private static final Map<Class<?>, Boolean> recyclerClassCache = new HashMap<>();
+    private static volatile long lastScanTime = 0L;
+    private static final long SCAN_THROTTLE_MS = 400L;
 
     private void applyTransparency(final Activity activity) {
         if (activity == null || activity.isFinishing()) {
@@ -1282,11 +1120,12 @@ public class HookEntry implements IXposedHookLoadPackage {
         }
         clearDecorScrimViews(root);
 
-        if (!ENABLE_TREE_SCAN) {
-            return;
-        }
-
-        scheduleScan(root);
+        root.post(new Runnable() {
+            @Override
+            public void run() {
+                scanNow(root);
+            }
+        });
 
         synchronized (LISTENER_ATTACHED) {
             if (!Boolean.TRUE.equals(LISTENER_ATTACHED.get(root))) {
@@ -1295,56 +1134,23 @@ public class HookEntry implements IXposedHookLoadPackage {
                         new ViewTreeObserver.OnGlobalLayoutListener() {
                             @Override
                             public void onGlobalLayout() {
-                                // Только планируем; сам обход -- позже и один на пачку перекладок.
-                                scheduleScan(root);
+                                long now = System.currentTimeMillis();
+                                if (now - lastScanTime >= SCAN_THROTTLE_MS) {
+                                    lastScanTime = now;
+                                    scanNow(root);
+                                }
                             }
                         });
             }
         }
     }
 
-    /** Ставит ровно один отложенный проход; пока он не выполнился, новые запросы игнорируются. */
-    private void scheduleScan(final View root) {
-        if (scanning) return;
-        if (!scanScheduled.compareAndSet(false, true)) return;
-        try {
-            root.postDelayed(new Runnable() {
-                @Override
-                public void run() {
-                    scanScheduled.set(false);
-                    scanNow(root);
-                }
-            }, SCAN_THROTTLE_MS);
-        } catch (Throwable t) {
-            scanScheduled.set(false);
-            XposedBridge.log("[TT] scheduleScan failed: " + t);
-        }
-    }
-
     private void scanNow(View root) {
-        if (scanning) return;
-        scanning = true;
-        long t0 = System.nanoTime();
-        scanNodes = 0;
-        scanChanges = 0;
-        scanCapHit = false;
-        int n = scanCounter.incrementAndGet();
-        if (n <= 10) {
-            // Строка "start" нужна, чтобы при зависании внутри скана было видно, что он начался.
-            XposedBridge.log("[TT] scan #" + n + " start");
-        }
         try {
             clearDecorScrimViews(root);
             stripOpaqueBackgrounds(root, root.getWidth(), root.getHeight(), 0);
         } catch (Throwable t) {
             XposedBridge.log("[TT] stripOpaqueBackgrounds failed: " + t);
-        } finally {
-            scanning = false;
-            long ms = (System.nanoTime() - t0) / 1000000L;
-            if (n <= 10 || ms > 16 || scanCapHit) {
-                XposedBridge.log("[TT] scan #" + n + " done: nodes=" + scanNodes + " changed=" + scanChanges
-                        + " ms=" + ms + (scanCapHit ? " (достигнут MAX_SCAN_NODES)" : ""));
-            }
         }
     }
 
@@ -1376,11 +1182,6 @@ public class HookEntry implements IXposedHookLoadPackage {
 
     private void neutralizeBlurSource(Drawable bg) {
         if (bg == null || bg instanceof ColorDrawable) return;
-        // Один и тот же экземпляр Drawable повторно не разбираем рефлексией.
-        synchronized (MEMO_LOCK) {
-            if (NEUTRALIZE_SEEN.containsKey(bg)) return;
-            NEUTRALIZE_SEEN.put(bg, Boolean.TRUE);
-        }
         Class<?> bgClass = bg.getClass();
         synchronized (SOURCE_NEUTRALIZE_LOCK) {
             if (neutralizedSourceClasses.contains(bgClass)) return;
@@ -1556,91 +1357,68 @@ public class HookEntry implements IXposedHookLoadPackage {
         }
     }
 
-    /** true, если View -- RecyclerView/AbsListView (по иерархии классов, с кэшем). */
-    private static boolean isRecyclerLike(View view) {
-        if (view instanceof AbsListView) return true;
-        Class<?> vc = view.getClass();
-        synchronized (MEMO_LOCK) {
-            Boolean cached = recyclerClassCache.get(vc);
-            if (cached != null) return cached;
-        }
-        boolean result = false;
-        Class<?> c = vc;
-        while (c != null && c != View.class && c != Object.class) {
-            String n = c.getName();
-            if (n.contains("RecyclerView") || n.contains("RecyclerListView")) {
-                result = true;
-                break;
-            }
-            c = c.getSuperclass();
-        }
-        synchronized (MEMO_LOCK) {
-            recyclerClassCache.put(vc, result);
-        }
-        return result;
-    }
-
-    private boolean alreadyApplied(Drawable d) {
-        synchronized (MEMO_LOCK) {
-            return ALPHA_APPLIED.containsKey(d);
-        }
-    }
-
-    private void markApplied(Drawable d) {
-        synchronized (MEMO_LOCK) {
-            ALPHA_APPLIED.put(d, Boolean.TRUE);
-        }
-    }
+    /**
+     * Раньше stripOpaqueBackgrounds перекрашивал КАЖДЫЙ View заново на КАЖДУЮ перекладку
+     * экрана, без какой-либо памяти -- включая уже обработанные, ничего не изменившиеся View.
+     * На большом дереве (новая AyuGram, заметно больше предыдущей по числу классов) это,
+     * похоже, превращалось в самоподдерживающийся цикл: наши же setBackgroundColor/setAlpha
+     * инвалидируют View, что может спровоцировать новую перекладку, которая запускает новый
+     * проход с теми же вызовами -- и так без остановки, подвешивая UI-поток. Теперь запоминаем
+     * для каждого View, какой именно объект-фон (Drawable, по identity) мы для него уже видели
+     * и обработали, и повторно трогаем View только если его фон реально сменился.
+     */
+    private static final WeakHashMap<View, Drawable> STRIPPED_SEEN_BG = new WeakHashMap<>();
 
     private void stripOpaqueBackgrounds(View view, int rootWidth, int rootHeight, int depth) {
         if (view == null || depth > 40) {
             return;
         }
-        if (scanNodes >= MAX_SCAN_NODES) {
-            scanCapHit = true;
-            return;
-        }
-        scanNodes++;
 
         Drawable bg = view.getBackground();
-        debugLogTopView(view, bg, rootHeight);
-        // Стеклянные панели всегда у верхнего края экрана, так что дорогую рефлексию гоняем
-        // только там (и один раз на экземпляр Drawable -- см. NEUTRALIZE_SEEN).
-        if (ENABLE_BLUR_NEUTRALIZE && bg != null && view.getTop() <= rootHeight * 0.20f) {
-            neutralizeBlurSource(bg);
+        boolean alreadySeen;
+        synchronized (STRIPPED_SEEN_BG) {
+            alreadySeen = STRIPPED_SEEN_BG.get(view) == bg;
         }
 
-        if (bg != null && isBlurDrawable(bg)) {
-            if (!alreadyApplied(bg)) {
+        if (!alreadySeen) {
+            debugLogTopView(view, bg, rootHeight);
+            // Стеклянные панели всегда у верхнего края экрана, так что дорогую рефлексию
+            // имеет смысл гонять только там же, где и диагностику.
+            if (view.getTop() <= rootHeight * 0.20f) {
+                neutralizeBlurSource(bg);
+            }
+
+            if (bg != null && isBlurDrawable(bg)) {
                 try {
                     bg.mutate().setAlpha(BLUR_ALPHA);
-                    markApplied(bg);
-                    scanChanges++;
                 } catch (Throwable ignored) {
+                }
+            } else if (bg != null && isEffectivelyOpaque(bg)) {
+                boolean fullWidth = view.getWidth() >= rootWidth * 0.85f;
+                boolean fullHeight = view.getHeight() >= rootHeight * 0.85f;
+                if (fullWidth && fullHeight) {
+                    try {
+                        if (bg instanceof ColorDrawable) {
+                            view.setBackgroundColor(WINDOW_BACKGROUND_COLOR);
+                        } else {
+                            bg.mutate().setAlpha(ALPHA);
+                        }
+                    } catch (Throwable ignored) {
+                    }
                 }
             }
-        } else if (bg != null && isEffectivelyOpaque(bg)) {
-            boolean fullWidth = view.getWidth() >= rootWidth * 0.85f;
-            boolean fullHeight = view.getHeight() >= rootHeight * 0.85f;
-            if (fullWidth && fullHeight) {
-                try {
-                    if (bg instanceof ColorDrawable) {
-                        view.setBackgroundColor(WINDOW_BACKGROUND_COLOR);
-                        scanChanges++;
-                    } else if (!alreadyApplied(bg)) {
-                        bg.mutate().setAlpha(ALPHA);
-                        markApplied(bg);
-                        scanChanges++;
-                    }
-                } catch (Throwable ignored) {
-                }
+
+            // Запоминаем фон ПОСЛЕ возможного патча -- setBackgroundColor подменяет сам
+            // объект Drawable на новый, поэтому сравнивать на следующем проходе нужно
+            // с итоговым состоянием, а не с тем, что было до патча (иначе memoization
+            // никогда бы не срабатывала и мы продолжали бы патчить по кругу).
+            Drawable finalBg = view.getBackground();
+            synchronized (STRIPPED_SEEN_BG) {
+                STRIPPED_SEEN_BG.put(view, finalBg);
             }
         }
 
         if (view instanceof ViewGroup) {
-            if (SKIP_RECYCLER_SUBTREES && isRecyclerLike(view)) {
-                return;
-            }
             ViewGroup group = (ViewGroup) view;
             int count = group.getChildCount();
             for (int i = 0; i < count; i++) {
