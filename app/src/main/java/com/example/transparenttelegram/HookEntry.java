@@ -9,6 +9,8 @@ import android.graphics.RectF;
 import android.graphics.drawable.ColorDrawable;
 import android.graphics.drawable.Drawable;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 import android.util.SparseArray;
 import android.view.View;
 import android.view.ViewGroup;
@@ -93,11 +95,10 @@ public class HookEntry implements IXposedHookLoadPackage {
      * сразу было видно, какая именно сборка тестируется, без сверки с файлом вручную.
      * Формат свободный, главное -- чтобы отличалось от предыдущего значения.
      */
-    private static final String MODULE_VERSION = "v16 (2026-10-06: подвисание на новой "
-            + "AyuGram -- скан дерева вынесен из onGlobalLayout в один отложенный проход, "
-            + "обработанные Drawable запоминаются (нет повторных mutate/setAlpha), "
-            + "поддеревья RecyclerView пропускаются, потолок MAX_SCAN_NODES, "
-            + "в лог пишутся тайминги сканов)";
+    private static final String MODULE_VERSION = "v17 (2026-10-06: зависание на AyuGram -- "
+            + "watchdog главного потока (стек в лог при зависании), resolveKeys без блокирующего "
+            + "лока (CAS, нет дедлока на <clinit>), тяжёлая рефлексия neutralizeBlurSource "
+            + "выключена флагом ENABLE_BLUR_NEUTRALIZE=false, флаг ENABLE_TREE_SCAN)";
 
     /**
      * Диагностический рубильник для нативного SIGSEGV-краша AyuGram (com.exteragram.messenger
@@ -115,6 +116,26 @@ public class HookEntry implements IXposedHookLoadPackage {
      * и/или сообщить баг самим разработчикам AyuGram, раз крашится их PluginsController).
      */
     private static final boolean ENABLE_EARLY_FRAMEWORK_HOOKS = false;
+
+    /**
+     * Watchdog: фоновый поток пингует главный Looper; если UI не отвечает дольше
+     * WATCHDOG_TIMEOUT_MS, в лог Xposed пишется стек главного потока (и стеки BLOCKED-потоков).
+     * По строкам "[TT][WATCHDOG]" видно, где именно висит UI.
+     */
+    private static final boolean ENABLE_WATCHDOG = true;
+    private static final long WATCHDOG_TIMEOUT_MS = 2000L;
+    private static final int WATCHDOG_MAX_DUMPS = 4;
+
+    /** false -- полностью отключить обход дерева View (для бисекции зависания). */
+    private static final boolean ENABLE_TREE_SCAN = true;
+
+    /**
+     * false -- не гонять в скане рефлексию + рантайм-хуки neutralizeBlurSource/
+     * neutralizeLiquidGlassTint. Это самая тяжёлая и непредсказуемая часть (хукает методы
+     * произвольных классов, найденных через поля Drawable). Если при false зависание уходит --
+     * виновник найден; тогда стеклянная шапка может остаться тёмной.
+     */
+    private static final boolean ENABLE_BLUR_NEUTRALIZE = false;
 
     /**
      * Общее затемнение: чёрный с этой альфой кладётся на окно и все "залитые" фоны.
@@ -166,11 +187,102 @@ public class HookEntry implements IXposedHookLoadPackage {
     private static volatile Set<Integer> textKeys = null;
     private static volatile Set<Integer> panelKeys = null;
     private static volatile Map<Integer, String> keyNamesByValue = null;
-    private static final Object KEYS_LOCK = new Object();
     private static volatile boolean keysResolveFailed = false;
-    private static volatile boolean resolving = false;
+
+    /** Неблокирующий флаг "кто-то уже разрешает ключи" (вместо synchronized -- см. resolveKeys). */
+    private static final AtomicBoolean resolveInProgress = new AtomicBoolean(false);
 
     private static final AtomicInteger getColorPatchLogCount = new AtomicInteger(0);
+
+    // =====================================================================
+    // Watchdog главного потока
+    // =====================================================================
+
+    private static final AtomicBoolean watchdogStarted = new AtomicBoolean(false);
+
+    private static void startWatchdog() {
+        if (!ENABLE_WATCHDOG) return;
+        if (!watchdogStarted.compareAndSet(false, true)) return;
+        try {
+            Thread t = new Thread(new Runnable() {
+                @Override
+                public void run() {
+                    Handler h = new Handler(Looper.getMainLooper());
+                    int dumps = 0;
+                    while (true) {
+                        final AtomicBoolean ponged = new AtomicBoolean(false);
+                        h.post(new Runnable() {
+                            @Override
+                            public void run() {
+                                ponged.set(true);
+                            }
+                        });
+                        try {
+                            Thread.sleep(WATCHDOG_TIMEOUT_MS);
+                        } catch (InterruptedException e) {
+                            return;
+                        }
+                        if (ponged.get()) {
+                            try {
+                                Thread.sleep(1000L);
+                            } catch (InterruptedException e) {
+                                return;
+                            }
+                            continue;
+                        }
+                        // Главный поток не ответил за WATCHDOG_TIMEOUT_MS.
+                        long blockedSince = System.currentTimeMillis() - WATCHDOG_TIMEOUT_MS;
+                        while (!ponged.get()) {
+                            if (dumps < WATCHDOG_MAX_DUMPS) {
+                                dumps++;
+                                dumpThreads(System.currentTimeMillis() - blockedSince);
+                            }
+                            for (int i = 0; i < 6 && !ponged.get(); i++) {
+                                try {
+                                    Thread.sleep(500L);
+                                } catch (InterruptedException e) {
+                                    return;
+                                }
+                            }
+                        }
+                        XposedBridge.log("[TT][WATCHDOG] UI-поток снова отвечает (завис ~"
+                                + (System.currentTimeMillis() - blockedSince) + " мс)");
+                    }
+                }
+            }, "TT-watchdog");
+            t.setDaemon(true);
+            t.start();
+            XposedBridge.log("[TT] watchdog started (timeout=" + WATCHDOG_TIMEOUT_MS + " мс)");
+        } catch (Throwable t) {
+            XposedBridge.log("[TT] watchdog start failed: " + t);
+        }
+    }
+
+    private static void dumpThreads(long blockedMs) {
+        try {
+            Thread main = Looper.getMainLooper().getThread();
+            XposedBridge.log("[TT][WATCHDOG] UI-поток не отвечает ~" + blockedMs + " мс, state="
+                    + main.getState());
+            StackTraceElement[] st = main.getStackTrace();
+            int n = Math.min(st.length, 40);
+            for (int i = 0; i < n; i++) {
+                XposedBridge.log("[TT][WATCHDOG] main #" + i + " " + st[i]);
+            }
+            for (Map.Entry<Thread, StackTraceElement[]> e : Thread.getAllStackTraces().entrySet()) {
+                Thread th = e.getKey();
+                if (th == main) continue;
+                if (th.getState() != Thread.State.BLOCKED) continue;
+                XposedBridge.log("[TT][WATCHDOG] BLOCKED thread '" + th.getName() + "'");
+                StackTraceElement[] ts = e.getValue();
+                int m = Math.min(ts.length, 15);
+                for (int i = 0; i < m; i++) {
+                    XposedBridge.log("[TT][WATCHDOG]   " + th.getName() + " #" + i + " " + ts[i]);
+                }
+            }
+        } catch (Throwable t) {
+            XposedBridge.log("[TT][WATCHDOG] dump failed: " + t);
+        }
+    }
 
     // =====================================================================
     // Структурный поиск
@@ -330,66 +442,71 @@ public class HookEntry implements IXposedHookLoadPackage {
     /**
      * Ленивое разрешение ключей. Только изнутри сработавшего хука getColor:
      * к этому моменту Theme уже инициализирован.
+     *
+     * ВАЖНО: раньше здесь был synchronized, а внутри через рефлексию вызывались статические
+     * методы классов Telegram (то есть могла запускаться их <clinit>). Если другой поток в этот
+     * момент сидел внутри <clinit> и дёрнул getColor -> наш хук -> synchronized, получался
+     * классический дедлок "лок против инициализации класса". Теперь лок неблокирующий (CAS):
+     * кто не успел занять флаг -- просто выходит и работает без патча до следующего вызова.
      */
     private static void resolveKeys() {
-        if (backgroundKeys != null || keysResolveFailed || resolving) return;
-        synchronized (KEYS_LOCK) {
-            if (backgroundKeys != null || keysResolveFailed || resolving) return;
-            resolving = true;
-            try {
-                List<Class<?>> classes = uiClasses;
-                if (classes == null) {
-                    keysResolveFailed = true;
-                    return;
-                }
-                Map<String, Integer> nameToKey = findNameToKeyMap(classes);
-                if (nameToKey == null) {
-                    keysResolveFailed = true;
-                    XposedBridge.log("[TT] карта ключей не найдена -- getColor-хук не будет патчить цвета. "
-                            + "View/Canvas-хуки работают как обычно.");
-                    return;
-                }
+        if (backgroundKeys != null || keysResolveFailed) return;
+        if (!resolveInProgress.compareAndSet(false, true)) return;
+        try {
+            if (backgroundKeys != null || keysResolveFailed) return;
 
-                Set<Integer> bg = new HashSet<>();
-                Set<Integer> txt = new HashSet<>();
-                Set<Integer> pnl = new HashSet<>();
-                Map<Integer, String> names = new HashMap<>();
-
-                for (String n : BG_NAMES) {
-                    Integer k = nameToKey.get(n);
-                    if (k != null) {
-                        bg.add(k);
-                        names.put(k, n);
-                    }
-                }
-                for (String n : TEXT_NAMES) {
-                    Integer k = nameToKey.get(n);
-                    if (k != null) {
-                        txt.add(k);
-                        names.put(k, n);
-                    }
-                }
-                for (String n : PANEL_NAMES) {
-                    Integer k = nameToKey.get(n);
-                    if (k != null && !bg.contains(k)) {
-                        pnl.add(k);
-                        names.put(k, n);
-                    }
-                }
-                if (bg.isEmpty() && txt.isEmpty() && pnl.isEmpty()) {
-                    keysResolveFailed = true;
-                    XposedBridge.log("[TT] нужные имена ключей не найдены в карте");
-                    return;
-                }
-                keyNamesByValue = names;
-                textKeys = txt;
-                panelKeys = pnl;
-                backgroundKeys = bg; // последним: по нему проверяется готовность
-                XposedBridge.log("[TT] ключи разрешены: bg=" + bg.size() + ", text=" + txt.size()
-                        + ", panel=" + pnl.size());
-            } finally {
-                resolving = false;
+            List<Class<?>> classes = uiClasses;
+            if (classes == null) {
+                keysResolveFailed = true;
+                return;
             }
+            Map<String, Integer> nameToKey = findNameToKeyMap(classes);
+            if (nameToKey == null) {
+                keysResolveFailed = true;
+                XposedBridge.log("[TT] карта ключей не найдена -- getColor-хук не будет патчить цвета. "
+                        + "View/Canvas-хуки работают как обычно.");
+                return;
+            }
+
+            Set<Integer> bg = new HashSet<>();
+            Set<Integer> txt = new HashSet<>();
+            Set<Integer> pnl = new HashSet<>();
+            Map<Integer, String> names = new HashMap<>();
+
+            for (String n : BG_NAMES) {
+                Integer k = nameToKey.get(n);
+                if (k != null) {
+                    bg.add(k);
+                    names.put(k, n);
+                }
+            }
+            for (String n : TEXT_NAMES) {
+                Integer k = nameToKey.get(n);
+                if (k != null) {
+                    txt.add(k);
+                    names.put(k, n);
+                }
+            }
+            for (String n : PANEL_NAMES) {
+                Integer k = nameToKey.get(n);
+                if (k != null && !bg.contains(k)) {
+                    pnl.add(k);
+                    names.put(k, n);
+                }
+            }
+            if (bg.isEmpty() && txt.isEmpty() && pnl.isEmpty()) {
+                keysResolveFailed = true;
+                XposedBridge.log("[TT] нужные имена ключей не найдены в карте");
+                return;
+            }
+            keyNamesByValue = names;
+            textKeys = txt;
+            panelKeys = pnl;
+            backgroundKeys = bg; // последним: по нему проверяется готовность
+            XposedBridge.log("[TT] ключи разрешены: bg=" + bg.size() + ", text=" + txt.size()
+                    + ", panel=" + pnl.size());
+        } finally {
+            resolveInProgress.set(false);
         }
     }
 
@@ -780,7 +897,10 @@ public class HookEntry implements IXposedHookLoadPackage {
                 + " MAX_SOURCE_SCAN_ATTEMPTS=" + MAX_SOURCE_SCAN_ATTEMPTS);
         XposedBridge.log("[TT] SCAN_THROTTLE_MS=" + SCAN_THROTTLE_MS
                 + " MAX_SCAN_NODES=" + MAX_SCAN_NODES
-                + " SKIP_RECYCLER_SUBTREES=" + SKIP_RECYCLER_SUBTREES);
+                + " SKIP_RECYCLER_SUBTREES=" + SKIP_RECYCLER_SUBTREES
+                + " ENABLE_TREE_SCAN=" + ENABLE_TREE_SCAN
+                + " ENABLE_BLUR_NEUTRALIZE=" + ENABLE_BLUR_NEUTRALIZE
+                + " ENABLE_WATCHDOG=" + ENABLE_WATCHDOG);
     }
 
     @Override
@@ -792,6 +912,7 @@ public class HookEntry implements IXposedHookLoadPackage {
         final String packageName = lpparam.packageName;
         final ClassLoader cl = lpparam.classLoader;
         logVersionBanner(packageName);
+        startWatchdog();
 
         // ---------- 1. LaunchActivity: окно ----------
         try {
@@ -1107,7 +1228,7 @@ public class HookEntry implements IXposedHookLoadPackage {
     private static final WeakHashMap<View, Boolean> LISTENER_ATTACHED = new WeakHashMap<>();
 
     /**
-     * Задержка перед отложенным проходом по дереву. Скан больше НЕ выполняется внутри
+     * Задержка перед отложенным проходом по дереву. Скан НЕ выполняется внутри
      * onGlobalLayout: слушатель лишь ставит один (коалесцированный) отложенный проход, так что
      * наши же setBackgroundColor/setAlpha -> новая перекладка -> новый скан не превращаются
      * в самоподдерживающийся цикл на UI-потоке.
@@ -1161,6 +1282,10 @@ public class HookEntry implements IXposedHookLoadPackage {
         }
         clearDecorScrimViews(root);
 
+        if (!ENABLE_TREE_SCAN) {
+            return;
+        }
+
         scheduleScan(root);
 
         synchronized (LISTENER_ATTACHED) {
@@ -1203,6 +1328,11 @@ public class HookEntry implements IXposedHookLoadPackage {
         scanNodes = 0;
         scanChanges = 0;
         scanCapHit = false;
+        int n = scanCounter.incrementAndGet();
+        if (n <= 10) {
+            // Строка "start" нужна, чтобы при зависании внутри скана было видно, что он начался.
+            XposedBridge.log("[TT] scan #" + n + " start");
+        }
         try {
             clearDecorScrimViews(root);
             stripOpaqueBackgrounds(root, root.getWidth(), root.getHeight(), 0);
@@ -1211,9 +1341,8 @@ public class HookEntry implements IXposedHookLoadPackage {
         } finally {
             scanning = false;
             long ms = (System.nanoTime() - t0) / 1000000L;
-            int n = scanCounter.incrementAndGet();
             if (n <= 10 || ms > 16 || scanCapHit) {
-                XposedBridge.log("[TT] scan #" + n + ": nodes=" + scanNodes + " changed=" + scanChanges
+                XposedBridge.log("[TT] scan #" + n + " done: nodes=" + scanNodes + " changed=" + scanChanges
                         + " ms=" + ms + (scanCapHit ? " (достигнут MAX_SCAN_NODES)" : ""));
             }
         }
@@ -1477,7 +1606,7 @@ public class HookEntry implements IXposedHookLoadPackage {
         debugLogTopView(view, bg, rootHeight);
         // Стеклянные панели всегда у верхнего края экрана, так что дорогую рефлексию гоняем
         // только там (и один раз на экземпляр Drawable -- см. NEUTRALIZE_SEEN).
-        if (bg != null && view.getTop() <= rootHeight * 0.20f) {
+        if (ENABLE_BLUR_NEUTRALIZE && bg != null && view.getTop() <= rootHeight * 0.20f) {
             neutralizeBlurSource(bg);
         }
 
