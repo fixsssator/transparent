@@ -91,9 +91,9 @@ public class HookEntry implements IXposedHookLoadPackage {
      * сразу было видно, какая именно сборка тестируется, без сверки с файлом вручную.
      * Формат свободный, главное -- чтобы отличалось от предыдущего значения.
      */
-    private static final String MODULE_VERSION = "v17 (2026-10-06: зависание ушло после очистки "
-            + "данных AyuGram, не было связано с хуками -- ENABLE_EARLY_FRAMEWORK_HOOKS=true "
-            + "снова включён, иначе шапка тёмная без RenderNode kill-switch)";
+    private static final String MODULE_VERSION = "v18 (2026-10-07: шапка в бете/AyuGram заметно "
+            + "прозрачнее списка, но всё ещё темнее -- PANEL_ALPHA снижен с 0x28 до 0x10, "
+            + "наравне с GLASS_BLEND_ALPHA_CAP)";
 
     /**
      * Диагностический рубильник для нативного SIGSEGV-краша AyuGram (com.exteragram.messenger
@@ -125,7 +125,7 @@ public class HookEntry implements IXposedHookLoadPackage {
      * Максимальная альфа для "панельных" ключей (закреп, верхние панели чата).
      * 0x00 -- полностью прозрачно, 0xFF -- как было. Если баннер всё ещё тёмный, уменьшайте.
      */
-    private static final int PANEL_ALPHA = 0x28;
+    private static final int PANEL_ALPHA = 0x10;
 
     /** Минимум static int-полей у класса Theme (в реальности ~850). */
     private static final int THEME_MIN_STATIC_INTS = 200;
