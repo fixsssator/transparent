@@ -5,6 +5,7 @@ import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.Paint;
 import android.graphics.PixelFormat;
+import android.graphics.Rect;
 import android.graphics.RectF;
 import android.graphics.drawable.ColorDrawable;
 import android.graphics.drawable.Drawable;
@@ -61,6 +62,15 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
  *     Для ключей из PANEL_NAMES альфа принудительно опускается до PANEL_ALPHA
  *     (чем меньше, тем прозрачнее). Крутите константу под вкус.
  *
+ *  D. (v19) Заливка стеклянных панелей.
+ *     Разбор dex AyuGram 20261005: BlurredBackgroundDrawableRenderNode.updateDisplayList() рисует
+ *     заливку панели через Canvas.drawColor(backgroundColor) в RecordingCanvas самой панели, причём
+ *     backgroundColor = Theme.multAlpha(Theme.getColor(key, provider), 0.76..0.85), то есть почти
+ *     непрозрачный, и рисуется дважды. Общий потолок GLASS_DRAWCOLOR_CAP=0x30 на двух слоях всё
+ *     равно давал ~34% чёрного поверх фона окна -- шапка получалась темнее списка. Теперь drawColor
+ *     на "маленьком" канвасе (высота <= GLASS_PANEL_MAX_HEIGHT_FRACTION от высоты экрана) режется до
+ *     GLASS_FILL_ALPHA (0x00 -- заливки нет вообще), а на больших канвасах остаётся прежний потолок.
+ *
  * Остальное как в v4: Theme = класс org.telegram.ui.ActionBar с максимумом static int-полей,
  * карта "ключ -> имя" -- static SparseArray-метод без аргументов со строкой "windowBackgroundWhite".
  *
@@ -91,9 +101,9 @@ public class HookEntry implements IXposedHookLoadPackage {
      * сразу было видно, какая именно сборка тестируется, без сверки с файлом вручную.
      * Формат свободный, главное -- чтобы отличалось от предыдущего значения.
      */
-    private static final String MODULE_VERSION = "v18 (2026-10-07: шапка в бете/AyuGram заметно "
-            + "прозрачнее списка, но всё ещё темнее -- PANEL_ALPHA снижен с 0x28 до 0x10, "
-            + "наравне с GLASS_BLEND_ALPHA_CAP)";
+    private static final String MODULE_VERSION = "v19 (2026-10-10: заливка стеклянных панелей "
+            + "определяется по размеру канваса и режется до GLASS_FILL_ALPHA=0x00; "
+            + "остальные drawColor -- прежний потолок 0x30)";
 
     /**
      * Диагностический рубильник для нативного SIGSEGV-краша AyuGram (com.exteragram.messenger
@@ -528,10 +538,28 @@ public class HookEntry implements IXposedHookLoadPackage {
 
     /** Во сколько раз ослабить цвет-тонировку стекла (1.0 = как было, 0.0 = без тонировки). */
     private static final float GLASS_TINT_SCALE = 0.35f;
-    /** Потолок альфы для полупрозрачных тёмных drawColor (тонировка стекла рисуется через drawColor). */
+    /** Потолок альфы для полупрозрачных тёмных drawColor на БОЛЬШИХ канвасах (затемнения и т.п.). */
     private static final int GLASS_DRAWCOLOR_CAP = 0x30;
     /** false -- не трогать полупрозрачные drawColor (если что-то лишнее стало прозрачным). */
     private static final boolean GLASS_PATCH_DRAWCOLOR = true;
+
+    /**
+     * (v19) Потолок альфы заливки именно СТЕКЛЯННЫХ панелей -- drawColor на маленьком канвасе
+     * (см. GLASS_PANEL_MAX_HEIGHT_FRACTION). 0x00 = заливки нет вовсе, шапка полностью
+     * "сквозная", как список. Если без заливки читаемость плохая -- поставьте 0x08..0x14.
+     */
+    private static final int GLASS_FILL_ALPHA = 0x00;
+
+    /**
+     * (v19) Канвас считается канвасом стеклянной панели, если его высота не больше этой доли
+     * высоты экрана. Шапка списка/чата, закреп, нижняя панель вкладок, поле ввода -- все заметно
+     * ниже 22% экрана; полноэкранные View и затемнения диалогов -- выше.
+     */
+    private static final float GLASS_PANEL_MAX_HEIGHT_FRACTION = 0.22f;
+
+    /** Высота экрана в px; заполняется из первой Activity. 0 -- ещё неизвестна (тогда правило не применяется). */
+    private static volatile int screenHeightPx = 0;
+    private static final AtomicInteger drawColorLogCount = new AtomicInteger(0);
 
     /**
      * У BLEND-хука (Theme.l1) отдельный, более низкий потолок альфы, чем у PANEL_ALPHA.
@@ -557,6 +585,34 @@ public class HookEntry implements IXposedHookLoadPackage {
 
     private static final AtomicInteger glassLogCount = new AtomicInteger(0);
     private static final AtomicInteger shaderDiagLogCount = new AtomicInteger(0);
+
+    /**
+     * (v19) true, если канвас -- RecordingCanvas стеклянной панели (маленький по высоте).
+     * Берём меньшее из getHeight() и высоты clipBounds: на RecordingCanvas getHeight() --
+     * размер RenderNode, а clip может быть уже, если панель пишется в больший узел.
+     */
+    private static boolean isGlassPanelCanvas(Canvas canvas, int[] outHeights) {
+        try {
+            int screenH = screenHeightPx;
+            int h = canvas.getHeight();
+            int ch = h;
+            try {
+                Rect r = canvas.getClipBounds();
+                if (r != null && !r.isEmpty()) ch = r.height();
+            } catch (Throwable ignored) {
+            }
+            if (outHeights != null) {
+                outHeights[0] = h;
+                outHeights[1] = ch;
+            }
+            if (screenH <= 0) return false;
+            int eff = Math.min(h > 0 ? h : Integer.MAX_VALUE, ch > 0 ? ch : Integer.MAX_VALUE);
+            if (eff == Integer.MAX_VALUE) return false;
+            return eff <= screenH * GLASS_PANEL_MAX_HEIGHT_FRACTION;
+        } catch (Throwable t) {
+            return false;
+        }
+    }
 
     /**
      * Наш собственный вызов setStatusBarColor(TRANSPARENT) в prepareWindow/applyTransparency --
@@ -693,8 +749,10 @@ public class HookEntry implements IXposedHookLoadPackage {
             XposedBridge.log("[TT] RuntimeShader hook failed: " + t);
         }
 
-        // 2. Тонировка также рисуется Canvas.drawColor на RenderNode-канвасе. Он RecordingCanvas,
+        // 2. Заливка стекла рисуется Canvas.drawColor на RenderNode-канвасе. Он RecordingCanvas,
         //    а RecordingCanvas переопределяет drawColor, поэтому хука на Canvas.drawColor мало.
+        //    (v19) На маленьком канвасе (стеклянная панель) заливка режется до GLASS_FILL_ALPHA,
+        //    на больших -- прежний потолок GLASS_DRAWCOLOR_CAP.
         try {
             Class<?> brc = XposedHelpers.findClassIfExists("android.graphics.BaseRecordingCanvas", null);
             if (brc != null) {
@@ -705,13 +763,31 @@ public class HookEntry implements IXposedHookLoadPackage {
                             int c = (Integer) param.args[0];
                             int a = Color.alpha(c);
                             if (!isDarkColor(c)) return;
-                            if (a == 255) {
+
+                            int[] heights = new int[2];
+                            boolean panel = (param.thisObject instanceof Canvas)
+                                    && isGlassPanelCanvas((Canvas) param.thisObject, heights);
+
+                            int cap;
+                            if (panel) {
+                                cap = GLASS_FILL_ALPHA;
+                            } else if (a == 255) {
                                 param.args[0] = WINDOW_BACKGROUND_COLOR;
-                            } else if (GLASS_PATCH_DRAWCOLOR && a > GLASS_DRAWCOLOR_CAP) {
-                                param.args[0] = (c & 0x00FFFFFF) | (GLASS_DRAWCOLOR_CAP << 24);
-                                if (glassLogCount.incrementAndGet() <= 10) {
-                                    XposedBridge.log("[TT] drawColor " + Integer.toHexString(c)
-                                            + " -> " + Integer.toHexString((Integer) param.args[0]));
+                                return;
+                            } else if (GLASS_PATCH_DRAWCOLOR) {
+                                cap = GLASS_DRAWCOLOR_CAP;
+                            } else {
+                                return;
+                            }
+
+                            if (a > cap) {
+                                int patched = (c & 0x00FFFFFF) | (cap << 24);
+                                param.args[0] = patched;
+                                if (drawColorLogCount.incrementAndGet() <= 16) {
+                                    XposedBridge.log("[TT] drawColor panel=" + panel
+                                            + " canvasH=" + heights[0] + " clipH=" + heights[1]
+                                            + " screenH=" + screenHeightPx + " "
+                                            + Integer.toHexString(c) + " -> " + Integer.toHexString(patched));
                                 }
                             }
                         } catch (Throwable ignored) {
@@ -768,6 +844,8 @@ public class HookEntry implements IXposedHookLoadPackage {
                 + " PANEL_ALPHA(панели)=0x" + Integer.toHexString(PANEL_ALPHA)
                 + " GLASS_BLEND_ALPHA_CAP(changeBrightness)=0x" + Integer.toHexString(GLASS_BLEND_ALPHA_CAP)
                 + " GLASS_DRAWCOLOR_CAP=0x" + Integer.toHexString(GLASS_DRAWCOLOR_CAP)
+                + " GLASS_FILL_ALPHA=0x" + Integer.toHexString(GLASS_FILL_ALPHA)
+                + " PANEL_MAX_H=" + GLASS_PANEL_MAX_HEIGHT_FRACTION
                 + " BLUR_ALPHA=0x" + Integer.toHexString(BLUR_ALPHA));
         XposedBridge.log("[TT] DISABLE_GLASS_RENDER_EFFECT=" + DISABLE_GLASS_RENDER_EFFECT
                 + " DEBUG_LOG_TOP_VIEWS=" + DEBUG_LOG_TOP_VIEWS
@@ -1042,8 +1120,17 @@ public class HookEntry implements IXposedHookLoadPackage {
     // Окно и сканирование View-дерева
     // =====================================================================
 
+    private static void rememberScreenHeight(Activity activity) {
+        try {
+            int h = activity.getResources().getDisplayMetrics().heightPixels;
+            if (h > 0) screenHeightPx = h;
+        } catch (Throwable ignored) {
+        }
+    }
+
     private void prepareWindow(Activity activity) {
         Window window = activity.getWindow();
+        rememberScreenHeight(activity);
         window.setFormat(PixelFormat.TRANSLUCENT);
         window.addFlags(WindowManager.LayoutParams.FLAG_SHOW_WALLPAPER);
         window.setDimAmount(0f);
@@ -1107,6 +1194,7 @@ public class HookEntry implements IXposedHookLoadPackage {
         }
 
         final Window window = activity.getWindow();
+        rememberScreenHeight(activity);
         window.setFormat(PixelFormat.TRANSLUCENT);
         window.addFlags(WindowManager.LayoutParams.FLAG_SHOW_WALLPAPER);
         window.setDimAmount(0f);
