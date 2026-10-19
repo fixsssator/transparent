@@ -101,9 +101,9 @@ public class HookEntry implements IXposedHookLoadPackage {
      * сразу было видно, какая именно сборка тестируется, без сверки с файлом вручную.
      * Формат свободный, главное -- чтобы отличалось от предыдущего значения.
      */
-    private static final String MODULE_VERSION = "v19 (2026-10-10: заливка стеклянных панелей "
-            + "определяется по размеру канваса и режется до GLASS_FILL_ALPHA=0x00; "
-            + "остальные drawColor -- прежний потолок 0x30)";
+    private static final String MODULE_VERSION = "v20 (2026-10-13: у RecordingCanvas крупных панелей "
+            + "getHeight()==0 -- такие drawColor с тёмным цветом и alpha 0x80..0xFE тоже считаются "
+            + "заливкой стекла и режутся до GLASS_FILL_ALPHA=0x00; полноэкранные -- прежний потолок 0x30)";
 
     /**
      * Диагностический рубильник для нативного SIGSEGV-краша AyuGram (com.exteragram.messenger
@@ -557,6 +557,17 @@ public class HookEntry implements IXposedHookLoadPackage {
      */
     private static final float GLASS_PANEL_MAX_HEIGHT_FRACTION = 0.22f;
 
+    /**
+     * (v20) По логам v19: у RecordingCanvas крупных стеклянных панелей (в т.ч. шапки) getHeight()
+     * и clipBounds равны 0 -- размер канваса неизвестен, и правило по высоте их не ловит
+     * ("drawColor panel=false canvasH=0 clipH=0 c22e4056 -> 302e4056"). Заливка стекла при этом
+     * всегда имеет alpha ~0xC2 (multAlpha(цвет, 0.76) в BlurredBackgroundColorProviderThemed).
+     * Поэтому если размер неизвестен, то тёмный drawColor с alpha в диапазоне
+     * [GLASS_FILL_MIN_ALPHA, 0xFE] тоже считается заливкой стекла. Обычный фон страницы
+     * (60000000, alpha 0x60) в этот диапазон не попадает и остаётся с потолком 0x30.
+     */
+    private static final int GLASS_FILL_MIN_ALPHA = 0x80;
+
     /** Высота экрана в px; заполняется из первой Activity. 0 -- ещё неизвестна (тогда правило не применяется). */
     private static volatile int screenHeightPx = 0;
     private static final AtomicInteger drawColorLogCount = new AtomicInteger(0);
@@ -765,8 +776,15 @@ public class HookEntry implements IXposedHookLoadPackage {
                             if (!isDarkColor(c)) return;
 
                             int[] heights = new int[2];
-                            boolean panel = (param.thisObject instanceof Canvas)
-                                    && isGlassPanelCanvas((Canvas) param.thisObject, heights);
+                            boolean bySize = false;
+                            if (param.thisObject instanceof Canvas) {
+                                bySize = isGlassPanelCanvas((Canvas) param.thisObject, heights);
+                            }
+                            // (v20) размер канваса неизвестен (RecordingCanvas отдаёт 0) --
+                            // опознаём заливку стекла по цвету: тёмный, alpha 0x80..0xFE.
+                            boolean byAlpha = !bySize && heights[0] <= 0
+                                    && a >= GLASS_FILL_MIN_ALPHA && a < 255;
+                            boolean panel = bySize || byAlpha;
 
                             int cap;
                             if (panel) {
@@ -783,8 +801,9 @@ public class HookEntry implements IXposedHookLoadPackage {
                             if (a > cap) {
                                 int patched = (c & 0x00FFFFFF) | (cap << 24);
                                 param.args[0] = patched;
-                                if (drawColorLogCount.incrementAndGet() <= 16) {
+                                if (drawColorLogCount.incrementAndGet() <= 40) {
                                     XposedBridge.log("[TT] drawColor panel=" + panel
+                                            + (bySize ? "(size)" : byAlpha ? "(alpha)" : "")
                                             + " canvasH=" + heights[0] + " clipH=" + heights[1]
                                             + " screenH=" + screenHeightPx + " "
                                             + Integer.toHexString(c) + " -> " + Integer.toHexString(patched));
@@ -846,6 +865,7 @@ public class HookEntry implements IXposedHookLoadPackage {
                 + " GLASS_DRAWCOLOR_CAP=0x" + Integer.toHexString(GLASS_DRAWCOLOR_CAP)
                 + " GLASS_FILL_ALPHA=0x" + Integer.toHexString(GLASS_FILL_ALPHA)
                 + " PANEL_MAX_H=" + GLASS_PANEL_MAX_HEIGHT_FRACTION
+                + " GLASS_FILL_MIN_ALPHA=0x" + Integer.toHexString(GLASS_FILL_MIN_ALPHA)
                 + " BLUR_ALPHA=0x" + Integer.toHexString(BLUR_ALPHA));
         XposedBridge.log("[TT] DISABLE_GLASS_RENDER_EFFECT=" + DISABLE_GLASS_RENDER_EFFECT
                 + " DEBUG_LOG_TOP_VIEWS=" + DEBUG_LOG_TOP_VIEWS
