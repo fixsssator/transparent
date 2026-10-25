@@ -22,6 +22,7 @@ import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.Enumeration;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -29,6 +30,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.WeakHashMap;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import dalvik.system.DexFile;
@@ -101,9 +103,9 @@ public class HookEntry implements IXposedHookLoadPackage {
      * сразу было видно, какая именно сборка тестируется, без сверки с файлом вручную.
      * Формат свободный, главное -- чтобы отличалось от предыдущего значения.
      */
-    private static final String MODULE_VERSION = "v20 (2026-10-13: у RecordingCanvas крупных панелей "
-            + "getHeight()==0 -- такие drawColor с тёмным цветом и alpha 0x80..0xFE тоже считаются "
-            + "заливкой стекла и режутся до GLASS_FILL_ALPHA=0x00; полноэкранные -- прежний потолок 0x30)";
+    private static final String MODULE_VERSION = "v21 (2026-10-19: глушатся drawBlurRect(Canvas,float,Rect,Paint,boolean) "
+            + "у SizeNotifierFrameLayout и наследников -- блюр-плашка под шапкой списка чатов; "
+            + "ищутся структурно по сигнатуре, без имён R8)";
 
     /**
      * Диагностический рубильник для нативного SIGSEGV-краша AyuGram (com.exteragram.messenger
@@ -866,6 +868,7 @@ public class HookEntry implements IXposedHookLoadPackage {
                 + " GLASS_FILL_ALPHA=0x" + Integer.toHexString(GLASS_FILL_ALPHA)
                 + " PANEL_MAX_H=" + GLASS_PANEL_MAX_HEIGHT_FRACTION
                 + " GLASS_FILL_MIN_ALPHA=0x" + Integer.toHexString(GLASS_FILL_MIN_ALPHA)
+                + " NEUTRALIZE_BLUR_RECT_BARS=" + NEUTRALIZE_BLUR_RECT_BARS
                 + " BLUR_ALPHA=0x" + Integer.toHexString(BLUR_ALPHA));
         XposedBridge.log("[TT] DISABLE_GLASS_RENDER_EFFECT=" + DISABLE_GLASS_RENDER_EFFECT
                 + " DEBUG_LOG_TOP_VIEWS=" + DEBUG_LOG_TOP_VIEWS
@@ -1274,6 +1277,63 @@ public class HookEntry implements IXposedHookLoadPackage {
     private static final Object TOP_LOG_LOCK = new Object();
 
     /**
+     * (v21) Верхний баннер списка чатов (и такие же панели в настройках/контактах/чате) рисуется НЕ
+     * стеклом и не drawColor, а методом SizeNotifierFrameLayout.drawBlurRect(Canvas, float y, Rect,
+     * Paint scrim, boolean top) и его переопределениями в наследниках (DialogsActivity$ContentView,
+     * ChatActivityFragmentView, SettingsActivity$1, ContactsActivity$5 ...): размытый снимок контента
+     * (BitmapShader) + scrim-краска через Canvas.drawRect(Rect, Paint). Именно перегрузку drawRect(Rect,
+     * Paint) наши хуки не трогали, и эти draw'ы не опознать по цвету (там шейдер и alpha < 255).
+     * Поэтому глушим сам метод. Ищется структурно: void-метод с параметрами
+     * (Canvas, float, Rect, Paint, boolean[, float|int]) у любого FrameLayout-наследника, который
+     * попал в дерево View. false -- вернуть оригинальную отрисовку баннеров.
+     */
+    private static final boolean NEUTRALIZE_BLUR_RECT_BARS = true;
+    private static final Set<Class<?>> blurRectChecked =
+            Collections.newSetFromMap(new ConcurrentHashMap<Class<?>, Boolean>());
+    private static final Set<Method> blurRectHooked = new HashSet<>();
+    private static final Object BLUR_RECT_LOCK = new Object();
+
+    private static boolean isBlurRectSignature(Method m) {
+        if (m.getReturnType() != void.class) return false;
+        int mod = m.getModifiers();
+        if (Modifier.isStatic(mod) || Modifier.isAbstract(mod)) return false;
+        Class<?>[] p = m.getParameterTypes();
+        if (p.length != 5 && p.length != 6) return false;
+        if (p[0] != Canvas.class || p[1] != float.class || p[2] != Rect.class
+                || p[3] != Paint.class || p[4] != boolean.class) return false;
+        return p.length == 5 || p[5] == float.class || p[5] == int.class;
+    }
+
+    /** Один раз на класс View: проходит по цепочке суперклассов и глушит найденные drawBlurRect. */
+    private static void maybeHookBlurRect(Class<?> viewClass) {
+        if (!NEUTRALIZE_BLUR_RECT_BARS) return;
+        if (!blurRectChecked.add(viewClass)) return;
+        Class<?> k = viewClass;
+        while (k != null && k != android.widget.FrameLayout.class && k != Object.class) {
+            try {
+                for (Method m : k.getDeclaredMethods()) {
+                    if (!isBlurRectSignature(m)) continue;
+                    synchronized (BLUR_RECT_LOCK) {
+                        if (!blurRectHooked.add(m)) continue;
+                    }
+                    m.setAccessible(true);
+                    XposedBridge.hookMethod(m, new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            param.setResult(null);
+                        }
+                    });
+                    XposedBridge.log("[TT] neutralized drawBlurRect: " + k.getName() + "." + m.getName()
+                            + Arrays.toString(m.getParameterTypes()) + " (view " + viewClass.getName() + ")");
+                }
+            } catch (Throwable t) {
+                XposedBridge.log("[TT] maybeHookBlurRect failed on " + k.getName() + ": " + t);
+            }
+            k = k.getSuperclass();
+        }
+    }
+
+    /**
      * Нейтрализация "источника" для блюра у кастомного Drawable-фона стеклянных панелей
      * (найденного через bg в обходе дерева View). Структурно не зависит от обфусцированных
      * имён: у такого Drawable находится поле интерфейсного типа (в разборе байткода 12.10.6
@@ -1480,6 +1540,10 @@ public class HookEntry implements IXposedHookLoadPackage {
     private void stripOpaqueBackgrounds(View view, int rootWidth, int rootHeight, int depth) {
         if (view == null || depth > 40) {
             return;
+        }
+
+        if (view instanceof android.widget.FrameLayout) {
+            maybeHookBlurRect(view.getClass());
         }
 
         Drawable bg = view.getBackground();
